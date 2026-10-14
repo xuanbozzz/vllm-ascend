@@ -283,8 +283,8 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
 
     def configure_expert_offload(self, config: ExpertOffloadConfig) -> None:
         if config.enabled:
-            if self.quant_method.quant_type != QuantType.W4A8MXFP:
-                raise ValueError("expert offload PR01 requires W4A8 MXFP routed expert weights")
+            if self.quant_method.quant_type not in (QuantType.W4A8MXFP, QuantType.VQ2A8):
+                raise ValueError("expert offload requires W4A8 MXFP or VQ2A8 routed expert weights")
             # The upstream loader otherwise moves the complete CPU expert
             # Parameters to the NPU before calling our bounded post-processing.
             self.requires_device_loading = False
@@ -333,7 +333,11 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
         for param_key, param_value in weight_param.items():
             param = torch.nn.Parameter(param_value, requires_grad=False)
             layer.register_parameter(param_key, param)
-            set_weight_attrs(param, extra_weight_attrs)
+            get_weight_attrs = getattr(self.quant_method, "get_weight_attrs", None)
+            attrs = dict(extra_weight_attrs)
+            if get_weight_attrs is not None:
+                attrs.update(get_weight_attrs(param_key))
+            set_weight_attrs(param, attrs)
 
         extra_weight_attrs.update({"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value})
         per_group_param = ["weight_scale_second", "weight_offset_second", "scale_bias"] + (

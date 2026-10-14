@@ -2633,6 +2633,15 @@ class NPUModelRunner(GPUModelRunner):
         defer_kv_connector_finalize = self.speculative_config is not None and (
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
+        # Only the ordinary generation path below always submits logits before
+        # publishing execute_model_state. Other callers (including dummy runs)
+        # must retain the check at the end of _model_forward.
+        defer_quantization_validity = (
+            getattr(self, "_quantization_validity", None) is not None
+            and get_pp_group().is_last_rank
+            and not self.is_pooling_model
+            and not self.broadcast_pp_output
+        )
         active_device_metadata_executor = self._prepare_device_metadata_for_forward(cudagraph_mode)
         with (
             record_function_or_nullcontext("forward"),
@@ -2679,7 +2688,12 @@ class NPUModelRunner(GPUModelRunner):
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
             hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds,
+                **(
+                    {"defer_quantization_validity": defer_quantization_validity}
+                    if self.model_config.quantization == "vq2a8" else {}
+                ),
+                **model_kwargs
             )
             self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
                 profiling_chunk_config,
@@ -2717,7 +2731,9 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = self._compute_logits(
+                    sample_hidden_states, check_quantization_validity=defer_quantization_validity
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -3274,6 +3290,65 @@ class NPUModelRunner(GPUModelRunner):
             "block_table": block_table.get_device_tensor(num_reqs),
         }
 
+    def _initialize_quantization_validity(self) -> None:
+        """Own post-forward status outside the graph pool for quantized experts."""
+        self._quantization_validity = None
+        self._quantization_validity_buffers = ()
+        if self.model_config.quantization != "vq2a8":
+            return
+        options = (self.vllm_config.additional_config or {}).get("vq2a8", {})
+        if options.get("decode_mode", "grouped") != "device":
+            return
+        if (
+            self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and breakable_cudagraph.is_breakable_cudagraph_enabled()
+        ):
+            raise ValueError("VQ2A8 decode graphs require VLLM_USE_BREAKABLE_CUDAGRAPH=0 to preserve the bank stream.")
+        states = {}
+        for module in self.model.modules():
+            weights = getattr(module, "vq2a8_weights", None)
+            if weights is None:
+                continue
+            index = module.vq2a8_layer_index
+            if index in states and states[index] is not weights:
+                raise RuntimeError(f"Duplicate quantization validity owner for layer {index}.")
+            states[index] = weights
+        if set(states) != set(self.vllm_config.quant_config.layers):
+            raise RuntimeError("Quantization validity must cover every configured expert layer.")
+        owners = tuple(states[index] for index in sorted(states))
+        if len({id(weights) for weights in owners}) != len(owners):
+            raise RuntimeError("Quantization validity owners must be distinct for each expert layer.")
+        for weights in owners:
+            flag = weights.validity_buffer
+            if flag.dtype != torch.bool or flag.shape != () or flag.device != self.device:
+                raise RuntimeError("Quantization validity requires a device-resident boolean scalar per layer.")
+        # Bind once, before any capture. Each captured layer copy_ targets its
+        # own view, while one zero_ prevents stale success from skipped layers.
+        self._quantization_validity = torch.zeros(len(owners), dtype=torch.bool, device=self.device)
+        self._quantization_validity_buffers = self._quantization_validity.unbind()
+        for weights, flag in zip(owners, self._quantization_validity_buffers):
+            weights.validity_buffer = flag
+            weights.defer_validity = True
+
+
+    def _check_quantization_validity(self) -> None:
+        validity = getattr(self, "_quantization_validity", None)
+        if validity is not None and not bool(validity.all()):
+            raise RuntimeError("Quantized expert forward failed validity checks.")
+
+
+    def _compute_logits(
+        self, hidden_states: torch.Tensor, *, check_quantization_validity: bool = False
+    ) -> torch.Tensor | None:
+        logits = self.model.compute_logits(hidden_states)
+        # Submit the LM Head while the model is still running, then make the
+        # fresh host decision before execute_model_state can reach sampling.
+        # Check even if compute_logits returns None; no caller may skip status.
+        if check_quantization_validity:
+            self._check_quantization_validity()
+        return logits
+
+
     def _model_forward(
         self,
         num_tokens_padded: int,
@@ -3281,6 +3356,8 @@ class NPUModelRunner(GPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        *,
+        defer_quantization_validity: bool = False,
         **model_kwargs: dict[str, Any],
     ):
         assert self.model is not None
@@ -3324,6 +3401,9 @@ class NPUModelRunner(GPUModelRunner):
                         **self._get_engram_device_inputs(),
                     )
                 )
+        validity = getattr(self, "_quantization_validity", None)
+        if validity is not None:
+            validity.zero_()
         run_model = partial(self.model, **model_inputs)
 
         try:
@@ -3342,6 +3422,8 @@ class NPUModelRunner(GPUModelRunner):
             if executor is not None and executor.submission_in_flight:
                 executor.release()
 
+        if not defer_quantization_validity and not forward_context.capturing:
+            self._check_quantization_validity()
         return hidden_states
 
     def _prepare_device_metadata_for_forward(
@@ -4593,6 +4675,8 @@ class NPUModelRunner(GPUModelRunner):
             and mm_config.is_multimodal_pruning_enabled()
         ) # type: bool
 
+        self._initialize_quantization_validity()
+
         # wrap the model with full graph wrapper if needed.
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
@@ -4638,6 +4722,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.model = ACLGraphWrapper(
                     self.model,
                     self.vllm_config,
+                    capture_on_current_stream=bool(self._quantization_validity_buffers),
                     runtime_mode=CUDAGraphMode.FULL,
                     use_eagle=self.use_eagle,
                     enable_enpu=self.enable_enpu,
@@ -4907,8 +4992,11 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in group_kv_cache_spec.layer_names:
                 if isinstance(group_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec[layer_name] = group_spec.kv_cache_specs[layer_name]
-                else:
-                    layer_kv_cache_spec[layer_name] = group_spec
+                    # Reuse the planned per-layer layout. EngineCore may have
+                    # replaced cache_config.block_size with the smallest group
+                    # size, which is not a valid DSV4 storage-table key.
+                    continue
+                layer_kv_cache_spec[layer_name] = group_spec
                 if static_forward_context is not None:
                     attn_layer = static_forward_context.get(layer_name)
                     if isinstance(attn_layer, AttentionLayerBase):

@@ -72,6 +72,8 @@ class MoETokenDispatchInput:
     topk_ids: torch.Tensor
     routing: MoeRouterInput
     quant: MoEQuantParams
+    # B1 VQ decode preserves one row for every selected route, including duplicates.
+    route_slot_layout: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +84,7 @@ class MoETokenDispatchOutput(Generic[TMoECombineMetadata]):
     combine_metadata: TMoECombineMetadata
     dynamic_scale: torch.Tensor | None = None
     topk_scales: torch.Tensor | None = None
+    route_expert_ids: torch.Tensor | None = None
 
 
 def build_token_dispatch_input(
@@ -94,4 +97,9 @@ def build_token_dispatch_input(
         topk_ids=fused_experts_input.topk_ids,
         routing=fused_experts_input.routing,
         quant=fused_experts_input.quant,
+        route_slot_layout=(
+            fused_experts_input.weights.vq2a8 is not None
+            and fused_experts_input.weights.vq2a8.decode_mode == "device"
+            and 0 < fused_experts_input.hidden_states.shape[0] <= fused_experts_input.weights.vq2a8.max_device_tokens
+        ),
     )

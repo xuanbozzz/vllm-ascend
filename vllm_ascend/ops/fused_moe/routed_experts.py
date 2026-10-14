@@ -431,7 +431,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
         vllm_config = get_current_vllm_config()
         self.n_shared_experts = n_shared_experts
         if ascend_config.expert_offload_config.enabled and getattr(self, "_expert_offload_binding", None) is None:
-            raise ValueError("expert offload PR01 requires W4A8 MXFP for every target-model routed expert layer")
+            raise ValueError("expert offload requires a supported adapter for every routed expert layer")
         self.mix_placement = getattr(ascend_config, "mix_placement", False)
         self.enable_npugraph_ex_static_kernel = ascend_config.ascend_compilation_config.enable_static_kernel
         self._use_v2_model_runner = bool(vllm_config.use_v2_model_runner)
@@ -655,6 +655,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.router is None:
             raise RuntimeError("AscendRoutedExperts requires a router for expert selection.")
+        self.router.vq2a8 = self.quant_type == QuantType.VQ2A8
         topk_weights, topk_ids = self.router._select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -691,6 +692,10 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
             topk_weights = torch.cat([topk_weights, shared_expert_weights], dim=1)
         if get_ascend_config().enable_force_eplb:
             topk_ids = get_force_eplb_topk(topk_ids, num_logical_experts)
+        elif enable_force_load_balance and self.quant_type == QuantType.VQ2A8:
+            stored_ids = torch.tensor(self.vq2a8_expert_ids, device=topk_ids.device, dtype=topk_ids.dtype)
+            slots = torch.randint(len(self.vq2a8_expert_ids), topk_ids.shape, device=topk_ids.device)
+            topk_ids = stored_ids[slots]
         elif enable_force_load_balance:
             random_matrix = torch.rand(
                 topk_ids.size(0),

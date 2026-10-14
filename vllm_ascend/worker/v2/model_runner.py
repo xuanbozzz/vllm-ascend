@@ -94,6 +94,7 @@ from vllm_ascend.observability.runtime_guard.hooks import (
 )
 from vllm_ascend.observability.runtime_guard.processor import RuntimeGuardProcessor
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
+from vllm_ascend.quantization.vq2a8_runtime import VQ2A8Runtime
 from vllm_ascend.utils import (
     is_deepseek_v41,
     lmhead_tp_enable,
@@ -143,6 +144,7 @@ class NPUModelRunner(GPUModelRunner):
         self.expert_offload_manager = (
             ExpertOffloadManager() if self.ascend_config.expert_offload_config.enabled else None
         )
+        self.vq2a8_runtime = None
         self.sparse_kv_offload_manager = None
         self.kvpp = KVPPRuntime()
         # Adaptive verification uses this flag to apply FIA-specific query
@@ -296,6 +298,12 @@ class NPUModelRunner(GPUModelRunner):
                 # The parent profiler finishes before the shared pool is
                 # allocated. Include it in the persistent model-memory budget.
                 self.model_memory_usage += torch.npu.memory_allocated(self.device) - allocated_before
+            if getattr(getattr(self, "model_config", None), "quantization", None) == "vq2a8":
+                allocated_before = torch.npu.memory_allocated(self.device)
+                self.vq2a8_runtime = VQ2A8Runtime(self.model, self.device, self.vllm_config.quant_config.layers)
+                if not self.vq2a8_runtime.owners:
+                    raise RuntimeError("VQ2A8 target has no registered native expert banks")
+                self.model_memory_usage += torch.npu.memory_allocated(self.device) - allocated_before
         except Exception:
             if manager is not None:
                 manager.close()
@@ -387,6 +395,9 @@ class NPUModelRunner(GPUModelRunner):
         if pcp_manager is not None and isinstance(pcp_manager, AscendPCPManager):
             pcp_manager._sampling_hidden_restored = False
         self._restore_replicated_draft_target_states()
+        runtime = getattr(self, "vq2a8_runtime", None)
+        if runtime is not None:
+            runtime.check()
         output = super().sample_tokens(grammar_output)
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).
@@ -608,8 +619,11 @@ class NPUModelRunner(GPUModelRunner):
         offload_manager = self.expert_offload_manager
         if offload_manager is not None:
             offload_manager.begin_execution(is_profile=is_profile or dummy_run)
+        runtime = getattr(self, "vq2a8_runtime", None)
         with dp_coordination_context:
             try:
+                if runtime is not None:
+                    runtime.begin()
                 output = super().execute_model(
                     scheduler_output,
                     intermediate_tensors=intermediate_tensors,
@@ -619,6 +633,8 @@ class NPUModelRunner(GPUModelRunner):
                     context_len=context_len,
                     valid_dummy_state_slots=valid_dummy_state_slots,
                 )
+                if runtime is not None:
+                    runtime.check()
                 forward_failed = False
             finally:
                 if offload_manager is not None:

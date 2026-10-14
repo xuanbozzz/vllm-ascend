@@ -106,6 +106,10 @@ if(SOC_VERSION MATCHES "ascend910_93.*")
   target_link_libraries(vllm_ascend_C PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+if(SOC_VERSION MATCHES "ascend950")
+  add_subdirectory(csrc/vq2a8_ascendc_v4_v2)
+endif()
+
 # Detect aclrtMemcpyBatchAsync availability (CANN 8.5+)
 # Can be overridden via VLLM_ASCEND_ENABLE_BATCH_MEMCPY env var (registered
 # in vllm_ascend/envs.py, forwarded by setup.py as a CMake variable):

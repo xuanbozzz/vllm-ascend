@@ -157,6 +157,9 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
         num_expert_group = self.num_expert_group if self.num_expert_group is not None else 1
         renorm = int(self.renormalize)
         if self.scoring_func == "sqrtsoftplus":
+            is_vq = getattr(self, "vq2a8", False)
+            if is_vq:
+                router_logits = router_logits.float()
             if self.tid2eid is not None or self.bias_vl is not None:
                 if input_ids is None:
                     raise ValueError("DeepSeek V4 vision/hash MoE routing requires input_ids.")
@@ -209,7 +212,7 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 tid2eid=tid2eid_ones,
                 k_group=topk_group,
                 group_count=num_expert_group,
-                routed_scaling_factor=self.routed_scaling_factor,
+                routed_scaling_factor=1.0 if is_vq else self.routed_scaling_factor,
                 eps=1e-20,
                 group_select_mode=1,
                 # The hash custom op currently accepts only renorm=0.
@@ -220,6 +223,8 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 image_sentinel_lo=self.image_sentinel_lo,
                 image_sentinel_count=DEEPSEEK_V4_IMAGE_SENTINEL_COUNT,
             )
+            if is_vq:
+                topk_weights = self._renormalize_topk_weights(topk_weights.float()) * self.routed_scaling_factor
             return topk_weights.to(torch.float32), topk_ids.to(torch.int32 if indices_type is None else indices_type)
         norm_type = 0 if self.scoring_func == "softmax" else 1
         if self.e_score_correction_bias is not None and self.e_score_correction_bias.dtype != router_logits.dtype:

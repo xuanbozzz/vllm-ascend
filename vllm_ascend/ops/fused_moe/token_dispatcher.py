@@ -372,6 +372,37 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         )
         global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
         restore_shape = hidden_states.shape
+        if token_dispatch_input.route_slot_layout:
+            if (
+                quant_type != QuantType.VQ2A8
+                or hidden_states.ndim != 2
+                or hidden_states.shape[0] < 1
+                or hidden_states.dtype != torch.bfloat16
+                or topk_ids.shape != (hidden_states.shape[0], self.top_k)
+                or topk_weights.shape != topk_ids.shape
+                or expert_map is not None
+                or global_redundant_expert_num
+                or token_dispatch_input.routing.log2phy is not None
+                or token_dispatch_input.routing.apply_router_weight_on_input
+                or dynamic_scale is not None
+            ):
+                raise ValueError("VQ2A8 route-slot dispatch requires BF16 rows without expert remapping.")
+            # Rows already use unpermute's [token, top-k] order. Identity
+            # indices preserve each probability, including repeated experts.
+            num_tokens = hidden_states.shape[0]
+            return MoETokenDispatchOutput(
+                hidden_states=hidden_states.repeat_interleave(self.top_k, dim=0),
+                group_list=torch.empty(0, dtype=torch.int64, device=hidden_states.device),
+                group_list_type=1,
+                route_expert_ids=topk_ids.reshape(-1),
+                combine_metadata=MoEAllGatherCombineMetadata(
+                    topk_weights=topk_weights,
+                    expanded_row_idx=torch.arange(
+                        num_tokens * self.top_k, dtype=torch.int32, device=hidden_states.device
+                    ),
+                    restore_shape=restore_shape,
+                ),
+            )
         # Fuse the first dynamic quant of moe_mlp into initrouting when
         # dispatch_with_quant is on but got a None dynamic_scale.
         if with_quant and dynamic_scale is None:

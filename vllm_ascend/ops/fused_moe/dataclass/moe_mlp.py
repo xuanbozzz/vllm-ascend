@@ -57,6 +57,7 @@ class MoEMlpComputeInput:
     swiglu_beta: float = 0.0
     expanded_row_idx: torch.Tensor | None = None
     topk_ids: torch.Tensor | None = None
+    route_expert_ids: torch.Tensor | None = None
     # Optional per-layer MoE LoRA state, propagated from MoEFusedExpertsInput.
     lora_context: Any = None
 
@@ -112,5 +113,6 @@ def build_mlp_compute_input(
         swiglu_beta=swiglu_beta,
         expanded_row_idx=expanded_row_idx,
         topk_ids=fused_experts_input.topk_ids,
+        route_expert_ids=token_dispatch_output.route_expert_ids,
         lora_context=fused_experts_input.lora_context,
     )

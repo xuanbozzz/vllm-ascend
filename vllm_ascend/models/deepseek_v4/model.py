@@ -293,7 +293,13 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError(f"Unsupported activation: {config.hidden_act}. Only silu is supported for now.")
 
         self.gate = ReplicatedLinear(
-            config.hidden_size, config.n_routed_experts, bias=False, quant_config=None, prefix=f"{prefix}.gate"
+            config.hidden_size,
+            config.n_routed_experts,
+            bias=False,
+            quant_config=None,
+            # Preserve FP32 checkpoint routers before the usual post-load cast.
+            params_dtype=torch.float32 if quant_config is not None and quant_config.get_name() == "vq2a8" else None,
+            prefix=f"{prefix}.gate",
         )
         self.gate.precast_fp32_weight = True
 
@@ -369,6 +375,7 @@ class DeepseekV4MoE(nn.Module):
             # DeepSeek V4: normalize top-k weights, then scale routed output.
             # AITER applies routed_scaling_factor internally.
             routed_scaling_factor=self.routed_scaling_factor,
+            apply_routed_scale_to_output=quant_config is not None and quant_config.get_name() == "vq2a8",
             swiglu_limit=self.swiglu_limit,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             bias_vl=self.gate.bias_vl,
@@ -1070,7 +1077,8 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
     def set_moe_parameters(self):
         self.expert_weights = []
 
-        self.num_expert_groups = getattr(self.config, "n_group", 1)
+        num_expert_groups = getattr(self.config, "n_group", None)
+        self.num_expert_groups = 1 if num_expert_groups is None else num_expert_groups
 
         self.moe_layers = []
         self.moe_mlp_layers = []
@@ -1137,6 +1145,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         self.model._set_aux_hidden_state_layers(layers)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        is_vq2a8 = self.quant_config is not None and self.quant_config.get_name() == "vq2a8"
         rocm_aiter_moe_shared_expert_enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
         rocm_aiter_moe_shared_expert_enabled = getattr(get_ascend_config(), "mix_placement", False)
         stacked_params_mapping = [
@@ -1158,6 +1167,38 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        loaded_root_shards: dict[int, set[int]] = {}
+        loaded_root_parameters: set[int] = set()
+
+        def check_root_parameter(param, value, name, shard_id=None):
+            if not is_vq2a8:
+                return
+            identity = id(param)
+            if identity in loaded_root_parameters or shard_id is None and identity in loaded_root_shards:
+                raise ValueError(f"Duplicate VQ2A8 root parameter {name}.")
+            if shard_id is None:
+                loaded_root_parameters.add(identity)
+            else:
+                shards = loaded_root_shards.setdefault(identity, set())
+                if shard_id in shards:
+                    raise ValueError(f"Duplicate VQ2A8 root shard for {name}.")
+                shards.add(shard_id)
+            if name.endswith(".gate.tid2eid"):
+                layer_index = int(name.split(".layers.", 1)[1].split(".", 1)[0])
+                expert_ids = self.quant_config.layer_spec(layer_index).expert_ids
+                if value.dtype not in (torch.int32, torch.int64) or not bool(
+                    torch.isin(value, torch.tensor(expert_ids, dtype=value.dtype, device=value.device)).all()
+                ):
+                    raise ValueError(f"Hash table {name} refers to experts absent from the VQ2A8 checkpoint.")
+                return
+            if value.dtype != param.dtype:
+                widen = (
+                    value.dtype == torch.bfloat16
+                    and param.dtype == torch.float32
+                    and (".gate." in name or ".compressor.norm." in name)
+                )
+                if not widen:
+                    raise ValueError(f"Unsupported VQ2A8 root dtype conversion for {name}.")
 
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
@@ -1215,10 +1256,22 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             if name.endswith(".gate.e_score_correction_bias") and name not in params_dict:
                 continue
 
+            if is_vq2a8 and ".mlp.experts." in name:
+                candidate = name
+                if candidate not in params_dict:
+                    candidate = name.replace(".mlp.experts.", ".mlp.experts.routed_experts.")
+                param = params_dict.get(candidate)
+                if param is None or not hasattr(param, "vq2a8_parameter_name"):
+                    raise ValueError(f"Expected a unified VQ2A8 expert parameter, got {name}.")
+                param.weight_loader(param, loaded_weight)
+                loaded_params.add(candidate)
+                continue
+
             if "sink" in name:
                 if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
+                check_root_parameter(param, loaded_weight, name)
                 # Route the write through the parameter's loader. A live weight
                 # update runs inside vLLM's layerwise reload, which parks the
                 # layer on the meta device and buffers every load made through
@@ -1240,7 +1293,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
+                if weight_name not in name or is_vq2a8 and name in params_dict:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
@@ -1269,6 +1322,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                     continue
 
                 param = params_dict[name]
+                check_root_parameter(param, loaded_weight, name, shard_id)
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1370,9 +1424,20 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                             continue
 
                         param = params_dict[name]
+                        check_root_parameter(param, loaded_weight, name)
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
                         weight_loader(param, loaded_weight)
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 
+        if is_vq2a8:
+            loaded_ids = {id(params_dict[name]) for name in loaded_params}
+            missing = [name for name, parameter in params_dict.items() if id(parameter) not in loaded_ids]
+            missing.extend(
+                name
+                for name, parameter in params_dict.items()
+                if id(parameter) in loaded_root_shards and loaded_root_shards[id(parameter)] != {0, 1}
+            )
+            if missing:
+                raise ValueError(f"Incomplete unified VQ2A8 checkpoint: {missing}.")
         return loaded_params

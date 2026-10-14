@@ -8,12 +8,18 @@ from .transfer import TorchExpertTransfer
 
 def supports_descriptor(bindings, desc) -> bool:
     """Bound distinct routes by the padded size, including dummy/padding rows."""
+
+    def route_bound(binding):
+        bound = desc.num_tokens * binding.top_k
+        available = getattr(getattr(binding, "adapter", None), "available_experts", None)
+        return bound if available is None else min(bound, len(available))
+
     return (
         bool(bindings)
         and desc.uniform_token_count is not None
         and desc.uniform_token_count > 0
         and desc.num_tokens % desc.uniform_token_count == 0
-        and all(0 < desc.num_tokens * binding.top_k <= binding.num_slots for binding in bindings)
+        and all(0 < route_bound(binding) <= binding.num_slots for binding in bindings)
     )
 
 

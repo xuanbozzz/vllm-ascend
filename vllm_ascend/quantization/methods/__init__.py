@@ -46,6 +46,7 @@ from .base import (
 )
 from .kv_cache import AscendFAQuantAttentionMethod
 from .registry import get_scheme_class, register_scheme
+from .w2a8 import AscendVQ2A8FusedMoEScheme
 from .w4a4 import (
     AscendW4A4FlatQuantDynamicLinearMethod,
     AscendW4A4LaosDynamicLinearMethod,
@@ -106,6 +107,7 @@ __all__ = [
     # Registry functions
     "register_scheme",
     "get_scheme_class",
+    "AscendVQ2A8FusedMoEScheme",
     # Utility functions
     "is_mx_quant_type",
     "resolve_block_scales",

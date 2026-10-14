@@ -315,7 +315,9 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         metadata = getattr(model_state, "device_metadata", None)
-        model = ModelWithContext(model, device_metadata=metadata)
+        model = ModelWithContext(
+            model, device_metadata=metadata, vq_runtime=getattr(self.model_runner, "vq2a8_runtime", None)
+        )
         pcp_manager = getattr(self.model_runner, "pcp_manager", None)
         if pcp_manager is not None:
             cudagraph_utils.prepare_inputs_to_capture = partial(
@@ -350,12 +352,15 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False, device_metadata=None):
+    def __init__(
+        self, original_model, is_draft_model=False, is_draft_model_prefill=False, device_metadata=None, vq_runtime=None
+    ):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
         self.device_metadata = device_metadata
+        self.vq_runtime = vq_runtime
 
     def forward(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -373,7 +378,14 @@ class ModelWithContext(nn.Module):
         try:
             if self.device_metadata is not None:
                 self.device_metadata.begin_forward()
-            return self.original_model(*args, **kwargs)
+            if self.vq_runtime is not None:
+                if not torch.npu.is_current_stream_capturing():
+                    self.vq_runtime.warm()
+                self.vq_runtime.begin()
+            output = self.original_model(*args, **kwargs)
+            if self.vq_runtime is not None and not torch.npu.is_current_stream_capturing():
+                self.vq_runtime.check()
+            return output
         finally:
             # Warmup and actual capture receive separate prepare_attn calls.
             # Retire each submission, including unused producers, after its

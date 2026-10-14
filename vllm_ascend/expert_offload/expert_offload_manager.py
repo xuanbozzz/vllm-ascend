@@ -13,6 +13,7 @@ from .quantization import MXFP4ExpertAdapter
 from .residency import ExpertResidency
 from .transfer import TorchExpertTransfer
 from .types import ExpertWeightView
+from .vq2a8 import VQ2A8ExpertAdapter, VQ2A8HostStore
 
 
 class OffloadState(Enum):
@@ -34,8 +35,13 @@ class LayerOffloadBinding:
         self.num_slots = config.num_device_experts
         self.top_k = layer.top_k
         self.device = torch.device(layer.moe_config.device)
-        self.adapter = MXFP4ExpertAdapter(layer, scheme)
-        self.host_store = HostExpertStore(layer, self.adapter.tensor_names)
+        if hasattr(scheme, "layer_spec"):
+            self.adapter = VQ2A8ExpertAdapter(layer, scheme)
+            self.num_slots = min(self.num_slots, len(self.adapter.available_experts))
+            self.host_store = VQ2A8HostStore(layer, self.adapter)
+        else:
+            self.adapter = MXFP4ExpertAdapter(layer, scheme)
+            self.host_store = HostExpertStore(layer, self.adapter.tensor_names)
         self.residency = ExpertResidency(self.num_experts, self.num_slots)
         self.manager: ExpertOffloadManager | None = None
         self.resident: dict[str, torch.Tensor] = {}
@@ -46,14 +52,17 @@ class LayerOffloadBinding:
             raise RuntimeError("expert offload does not support weight reload or repeated post-processing")
         try:
             self.host_store.finalize(layer, pin_memory=self.device.type == "npu")
-            self.resident = self.adapter.materialize(self.host_store, range(self.num_slots), self.device)
+            initial_ids = getattr(self.adapter, "available_experts", tuple(range(self.num_slots)))[: self.num_slots]
+            self.resident = self.adapter.materialize(self.host_store, initial_ids, self.device)
             if self.device.type == "npu":
                 torch.npu.current_stream(self.device).synchronize()
                 self.host_store.prepare_native(self.adapter, self.resident, self.device)
             # Preserve Parameter metadata/loaders, and allocate no full device layer here.
             for name, tensor in self.resident.items():
                 getattr(layer, name).data = tensor
-            self.residency.commit(self.residency.plan(range(self.num_slots)))
+            self.residency.commit(self.residency.plan(initial_ids))
+            if isinstance(self.adapter, VQ2A8ExpertAdapter) and self.device.type == "npu":
+                layer.vq2a8_weights = self.adapter.make_view(layer, self.resident, full_pool=False).vq2a8_weights
         except Exception:
             self.close()
             raise
@@ -71,7 +80,7 @@ class LayerOffloadBinding:
             staging: GraphExpertStaging = self.graph_staging[key]
             physical_ids = staging.prepare(selected_ids)
             return (
-                ExpertWeightView(layer, self.resident),
+                self.make_view(layer, self.resident, full_pool=False),
                 physical_ids,
                 manager.get_comm(self, layer.moe_config, self.num_slots),
             )
@@ -79,7 +88,10 @@ class LayerOffloadBinding:
             if manager.capturing_graphs:
                 from .graph import GraphExpertStaging
 
-                if selected_ids.numel() > self.num_slots:
+                route_bound = min(
+                    selected_ids.numel(), len(getattr(self.adapter, "available_experts", range(self.num_experts)))
+                )
+                if route_bound > self.num_slots:
                     raise RuntimeError("expert graph shape exceeds resident capacity")
                 key = (tuple(selected_ids.shape), selected_ids.dtype)
                 if key not in self.graph_staging:
@@ -89,7 +101,7 @@ class LayerOffloadBinding:
             plan = self.residency.plan(logical_ids)
             full_pool = manager.has_prefill or manager.is_profile or plan.use_full_pool
             if full_pool:
-                tensors = manager.prefill_pool.fill(self)
+                tensors = manager.get_prefill_pool(self).fill(self)
                 physical_ids = selected_ids
                 count = self.num_experts
             else:
@@ -100,15 +112,26 @@ class LayerOffloadBinding:
                 tensors = self.resident
                 count = self.num_slots
             # A private comm instance avoids mutating the cached full-layer dispatcher.
-            return ExpertWeightView(layer, tensors), physical_ids, manager.get_comm(self, layer.moe_config, count)
+            return (
+                self.make_view(layer, tensors, full_pool=full_pool),
+                physical_ids,
+                manager.get_comm(self, layer.moe_config, count),
+            )
         except Exception:
             manager.state = OffloadState.FAILED
             raise
+
+    def make_view(self, layer, tensors, *, full_pool):
+        if isinstance(self.adapter, VQ2A8ExpertAdapter):
+            return self.adapter.make_view(layer, tensors, full_pool=full_pool)
+        return ExpertWeightView(layer, tensors)
 
     def close(self) -> None:
         self.host_store.close()
         self.resident.clear()
         self.graph_staging.clear()
+        if isinstance(self.adapter, VQ2A8ExpertAdapter):
+            self.adapter.banks.clear()
         self.manager = None
 
 
@@ -119,6 +142,7 @@ class ExpertOffloadManager:
         self.state = OffloadState.REGISTERING
         self.bindings: dict[str, LayerOffloadBinding] = {}
         self.prefill_pool = PrefillExpertPool()
+        self.vq_prefill_pools = {}
         self.comm_methods = {}
         self.executing = False
         self.has_prefill = True
@@ -170,7 +194,11 @@ class ExpertOffloadManager:
                     raise RuntimeError("incomplete or duplicate expert offload layer registration")
                 self.bindings[binding.layer_name] = binding
                 binding.manager = self
-                self.prefill_pool.initialize(binding)
+                pool = self.get_prefill_pool(binding)
+                pool.initialize(binding)
+                if isinstance(binding.adapter, VQ2A8ExpertAdapter) and binding.device.type == "npu":
+                    # Construct all banks before validity ownership and capture.
+                    binding.make_view(binding.adapter.layer, pool.tensors, full_pool=True)
             if not self.bindings:
                 raise RuntimeError("expert offload found no supported target-model expert layers")
             self.state = OffloadState.READY
@@ -183,6 +211,14 @@ class ExpertOffloadManager:
                     binding.close()
                 self.state = OffloadState.FAILED
             raise
+
+    def get_prefill_pool(self, binding):
+        if not isinstance(binding.adapter, VQ2A8ExpertAdapter):
+            return self.prefill_pool
+        signature = binding.adapter.signature(binding.host_store)
+        if signature not in self.vq_prefill_pools:
+            self.vq_prefill_pools[signature] = PrefillExpertPool()
+        return self.vq_prefill_pools[signature]
 
     def get_comm(self, binding, moe_config, count):
         # Lazy import avoids an initialization cycle with quantization and routed experts.
@@ -239,5 +275,8 @@ class ExpertOffloadManager:
             self.bindings.clear()
             self.comm_methods.clear()
             self.prefill_pool.close()
+            for pool in self.vq_prefill_pools.values():
+                pool.close()
+            self.vq_prefill_pools.clear()
             self.executing = False
             self.state = OffloadState.CLOSED

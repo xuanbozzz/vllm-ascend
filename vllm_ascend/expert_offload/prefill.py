@@ -20,7 +20,8 @@ class PrefillExpertPool:
                 raise ValueError("expert offload PR01 requires homogeneous expert layouts for the shared prefill pool")
             return
         # Allocate in the scheme's native format, including scale strides.
-        self.tensors = binding.adapter.allocate_pool(binding.host_store, binding.num_experts, binding.device)
+        count = getattr(binding.host_store, "num_experts", binding.num_experts)
+        self.tensors = binding.adapter.allocate_pool(binding.host_store, count, binding.device)
         self.signature = signature
 
     def fill(self, binding):
@@ -30,7 +31,10 @@ class PrefillExpertPool:
             binding.adapter,
             binding.host_store,
             self.tensors,
-            tuple((eid, eid) for eid in range(binding.num_experts)),
+            tuple(
+                (eid, row)
+                for row, eid in enumerate(getattr(binding.host_store, "expert_ids", tuple(range(binding.num_experts))))
+            ),
             binding.device,
         )
         return self.tensors

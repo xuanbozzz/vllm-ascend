@@ -93,6 +93,33 @@ class AscendGroupedTopKRouter(BaseRouter):
             topk_weights = router_logits.sigmoid()
         elif self.scoring_func == "sqrtsoftplus":
             topk_weights = F.softplus(router_logits).sqrt()
+            if getattr(self, "vq2a8", False):
+                topk_weights = F.softplus(router_logits.float()).sqrt()
+                if self.use_grouped_topk and (self.num_expert_group or 1) != 1:
+                    raise ValueError("Native sqrtsoftplus routing requires one expert group.")
+                table = getattr(self, "tid2eid", None)
+                if table is not None:
+                    if self.e_score_correction_bias is not None:
+                        raise ValueError("Hash routing cannot also use a correction bias.")
+                    if input_ids is None:
+                        raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+                    token_ids = torch.where(input_ids == -1, 0, input_ids).to(torch.int64)
+                    if token_ids.shape != (router_logits.shape[0],) or table.shape[1] != self.top_k:
+                        raise ValueError("Hash token IDs or table do not match the routing shape.")
+                    topk_ids = table[token_ids].to(torch.int64)
+                else:
+                    choice = topk_weights.clone()
+                    if self.e_score_correction_bias is not None:
+                        choice += self.e_score_correction_bias.float()
+                    selected = []
+                    # DeepSeek V4 selects the lowest expert ID when scores tie.
+                    for _ in range(self.top_k):
+                        index = choice.argmax(dim=-1, keepdim=True)
+                        selected.append(index)
+                        choice.scatter_(1, index, float("-inf"))
+                    topk_ids = torch.cat(selected, dim=1)
+                weights = self._renormalize_topk_weights(topk_weights.gather(1, topk_ids))
+                return weights * self.routed_scaling_factor, topk_ids.to(indices_type or torch.int32)
         else:
             raise ValueError(f"Unsupported scoring function: {self.scoring_func}")
 

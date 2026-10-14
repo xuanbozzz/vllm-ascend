@@ -77,7 +77,10 @@ class ExpertOffloadConfig:
             if (
                 getattr(speculative, "method", None) != "dspark"
                 or draft is None
-                or draft.model != vllm_config.model_config.model
+                or (
+                    draft.model != vllm_config.model_config.model
+                    and getattr(vllm_config.model_config, "quantization", None) != "vq2a8"
+                )
                 or draft.hf_config.model_type != "deepseek_v4"
                 or draft.hf_config.architectures != ["DSparkDraftModel"]
                 or not speculative.enforce_eager
@@ -94,7 +97,7 @@ class ExpertOffloadConfig:
         if str(vllm_config.load_config.load_format) not in ("auto", "safetensors", "pt"):
             raise ValueError("expert offload PR01 supports auto, safetensors, or pt checkpoint loading only")
         if getattr(vllm_config.model_config.hf_text_config, "model_type", None) != "deepseek_v4":
-            raise ValueError("expert offload PR01 supports the DeepSeek V4 W4A8 MXFP model contract only")
+            raise ValueError("expert offload supports DeepSeek V4 W4A8 MXFP or VQ2A8 experts")
         for name in ("mix_placement", "enable_force_eplb", "enable_fused_mc2", "multistream_overlap_shared_expert"):
             if getattr(ascend_config, name):
                 raise ValueError(f"expert offload PR01 does not support {name}")

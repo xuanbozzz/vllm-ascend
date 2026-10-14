@@ -97,6 +97,7 @@ class ACLGraphWrapper:
         *,
         use_eagle: bool = False,
         enable_enpu: bool = False,
+        capture_on_current_stream: bool = False,
         update_stream: torch.npu.Stream | None = None,
     ):
         self.runnable = runnable
@@ -122,6 +123,7 @@ class ACLGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # aclgraphs for.
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
+        self.capture_on_current_stream = capture_on_current_stream
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
         self.update_stream = update_stream
@@ -207,7 +209,8 @@ class ACLGraphWrapper:
                 get_offloader().sync_prev_onload()
                 forward_context.capturing = True
                 try:
-                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                    capture_kwargs = {"stream": torch.npu.current_stream()} if self.capture_on_current_stream else {}
+                    with torch.npu.graph(aclgraph, pool=self.graph_pool, **capture_kwargs):
                         # `output` is managed by pytorch's aclgraph pool
                         with super_kernel_scope("full_model", self.enable_super_kernel):
                             output = self.runnable(*args, **kwargs)

@@ -23,7 +23,13 @@ class TorchExpertTransfer:
                 raise RuntimeError("incomplete prepared expert transfer bundle")
             # Validate the entire batch before touching any resident storage.
             copies = [
-                TorchExpertTransfer._host_copy_parameters(destination[name], prepared, expert_id, slot, torch_npu)
+                TorchExpertTransfer._host_copy_parameters(
+                    destination[name],
+                    prepared,
+                    host_store.rows[expert_id] if hasattr(host_store, "rows") else expert_id,
+                    slot,
+                    torch_npu,
+                )
                 for expert_id, slot in loads
                 for name, prepared in host_store.prepared.items()
             ]

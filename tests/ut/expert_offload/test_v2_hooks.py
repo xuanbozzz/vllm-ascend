@@ -358,7 +358,7 @@ def test_quant_wrapper_preserves_disabled_allocation_and_bounds_enabled_loading(
             "set_weight_attrs": set_attrs,
             "ExpertOffloadConfig": ExpertOffloadConfig,
             "LayerOffloadBinding": binding_factory,
-            "QuantType": SimpleNamespace(W4A8MXFP="mxfp4"),
+            "QuantType": SimpleNamespace(W4A8MXFP="mxfp4", VQ2A8="vq2a8"),
             "FusedMoeWeightScaleSupported": SimpleNamespace(
                 CHANNEL=SimpleNamespace(value="channel"),
                 GROUP=SimpleNamespace(value="group"),

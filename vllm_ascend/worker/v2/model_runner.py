@@ -289,7 +289,10 @@ class NPUModelRunner(GPUModelRunner):
             super().load_model(load_dummy_weights, *args, **kwargs)
             if manager is not None:
                 allocated_before = torch.npu.memory_allocated(self.device)
-                manager.finalize_loading(self.model)
+                draft_model = getattr(self.speculator, "model", None)
+                manager.finalize_loading(self.model, draft_model)
+                if self.speculator is not None:
+                    self.speculator.expert_offload_manager = manager
                 # The parent profiler finishes before the shared pool is
                 # allocated. Include it in the persistent model-memory budget.
                 self.model_memory_usage += torch.npu.memory_allocated(self.device) - allocated_before

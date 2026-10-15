@@ -47,6 +47,47 @@ def make_configs():
     return vc, ac
 
 
+def make_dspark():
+    return SimpleNamespace(
+        method="dspark",
+        enforce_eager=True,
+        enable_adaptive_verification=False,
+        draft_model_config=SimpleNamespace(
+            model="/models/target",
+            hf_config=SimpleNamespace(model_type="deepseek_v4", architectures=["DSparkDraftModel"]),
+        ),
+    )
+
+
+def test_checkpoint_dspark_with_eager_drafting_is_supported():
+    vc, ac = make_configs()
+    vc.speculative_config = make_dspark()
+    ExpertOffloadConfig(enabled=True, num_device_experts=96).validate(vc, ac)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("method", "mtp"), ("enforce_eager", False), ("enable_adaptive_verification", True)]
+)
+def test_unsupported_speculative_modes_are_rejected(field, value):
+    vc, ac = make_configs()
+    vc.speculative_config = make_dspark()
+    setattr(vc.speculative_config, field, value)
+    with pytest.raises(ValueError, match="speculative_config"):
+        ExpertOffloadConfig(enabled=True, num_device_experts=96).validate(vc, ac)
+
+
+def test_external_dspark_checkpoint_and_multi_request_drafting_are_rejected():
+    vc, ac = make_configs()
+    vc.speculative_config = make_dspark()
+    vc.speculative_config.draft_model_config.model = "/models/other"
+    with pytest.raises(ValueError, match="speculative_config"):
+        ExpertOffloadConfig(enabled=True, num_device_experts=96).validate(vc, ac)
+    vc.speculative_config = make_dspark()
+    vc.scheduler_config.max_num_seqs = 2
+    with pytest.raises(ValueError, match="max_num_seqs"):
+        ExpertOffloadConfig(enabled=True, num_device_experts=96).validate(vc, ac)
+
+
 def test_defaults_and_disabled_validation():
     cfg = ExpertOffloadConfig()
     assert not cfg.enabled and cfg.num_device_experts is None

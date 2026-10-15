@@ -154,12 +154,14 @@ class ExpertOffloadManager:
             self.capturing_graphs = False
             self.finish_execution(failed=failed)
 
-    def finalize_loading(self, model) -> None:
+    def finalize_loading(self, model, draft_model=None) -> None:
         if self.state is not OffloadState.REGISTERING:
             raise RuntimeError("expert offload can only finalize once")
         discovered = [
             binding
-            for layer in model.modules()
+            for root in (model, draft_model)
+            if root is not None
+            for layer in root.modules()
             if (binding := getattr(layer, "_expert_offload_binding", None)) is not None
         ]
         try:
@@ -202,7 +204,7 @@ class ExpertOffloadManager:
 
     @contextmanager
     def execution(self, *, has_prefill: bool = True, is_profile: bool = False):
-        """Own a serialized eager execution scope."""
+        """Own eager draft execution separately from the target forward."""
         self.begin_execution(is_profile=is_profile)
         self.has_prefill = has_prefill
         failed = True

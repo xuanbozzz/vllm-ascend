@@ -71,8 +71,23 @@ class ExpertOffloadConfig:
         for name in ("lora_config", "kv_transfer_config"):
             if getattr(vllm_config, name, None) is not None:
                 raise ValueError(f"expert offload PR01 does not support {name}")
-        if vllm_config.speculative_config is not None:
-            raise ValueError("expert offload does not support speculative_config yet")
+        speculative = vllm_config.speculative_config
+        if speculative is not None:
+            draft = getattr(speculative, "draft_model_config", None)
+            if (
+                getattr(speculative, "method", None) != "dspark"
+                or draft is None
+                or draft.model != vllm_config.model_config.model
+                or draft.hf_config.model_type != "deepseek_v4"
+                or draft.hf_config.architectures != ["DSparkDraftModel"]
+                or not speculative.enforce_eager
+                or speculative.enable_adaptive_verification
+                or vllm_config.scheduler_config.max_num_seqs != 1
+            ):
+                raise ValueError(
+                    "expert offload speculative_config supports only the checkpoint's DeepSeek V4 DSpark "
+                    "with eager drafting, fixed verification and max_num_seqs=1"
+                )
         offload = vllm_config.offload_config
         if offload.uva.cpu_offload_gb or offload.prefetch.offload_group_size:
             raise ValueError("expert offload cannot be combined with generic CPU weight offload")

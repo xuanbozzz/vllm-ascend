@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -157,9 +158,113 @@ def test_load_preserves_parent_contract_and_accounts_pool_memory():
     runner, events = make_runner(manager=manager)
     runner.load_model(False, "extra", reload=False)
     assert events == [("parent_load", False, ("extra",), {"reload": False})]
-    manager.finalize_loading.assert_called_once_with(runner.model)
+    manager.finalize_loading.assert_called_once_with(runner.model, None)
     assert runner.model_memory_usage == 1064
     assert runner.pd_dspark_aux_layer_ids == [9]
+
+
+def test_load_adopts_draft_layers_and_shares_runner_owned_manager():
+    manager = Mock()
+    runner, _ = make_runner(manager=manager)
+    runner.speculator = SimpleNamespace(model=object())
+    runner.load_model()
+    manager.finalize_loading.assert_called_once_with(runner.model, runner.speculator.model)
+    assert runner.speculator.expert_offload_manager is manager
+
+
+@pytest.mark.parametrize("profile,failed", [(False, False), (True, False), (False, True)])
+def test_dspark_propose_owns_draft_lifecycle_and_preserves_parent_arguments(profile, failed):
+    manager = ExpertOffloadManager()
+    manager.state = OffloadState.READY
+
+    class Parent:
+        def propose(self, *args, **kwargs):
+            assert manager.executing and not manager.has_prefill
+            assert manager.is_profile is profile
+            assert kwargs["is_profile"] is profile
+            if failed:
+                raise RuntimeError("draft failed")
+            return args
+
+    cls = load_hook_class(
+        "vllm_ascend/worker/v2/spec_decode/dspark/speculator.py",
+        "AscendDSparkSpeculator",
+        {"propose"},
+        Parent,
+        {
+            "torch": torch,
+            "nullcontext": nullcontext,
+            "build_attn_metadata_wrapper": nullcontext,
+            "build_attn_metadata_factory": lambda *_a, **_k: nullcontext(),
+        },
+    )
+    draft = cls()
+    draft.expert_offload_manager = manager
+    draft.replicated_pcp = False
+    draft.enable_adaptive_verification = False
+    draft.use_dcp = False
+    draft.input_buffers = SimpleNamespace(positions=object())
+    draft.max_num_tokens = 16
+    draft.attn_vllm_config = SimpleNamespace(parallel_config=object())
+    batch = SimpleNamespace(is_prefilling_np=np.array([True]))
+    args = (batch, {}, {}, *[object() for _ in range(8)])
+    if failed:
+        with pytest.raises(RuntimeError, match="draft failed"):
+            draft.propose(*args, is_profile=profile)
+    else:
+        result = draft.propose(*args, is_profile=profile)
+        assert result[:11] == args
+    assert not manager.executing and manager.has_prefill
+    assert manager.state is (OffloadState.FAILED if failed else OffloadState.READY)
+
+
+@pytest.mark.parametrize("sizes", [(128, 128), (128, 256)])
+def test_dspark_input_preparation_uses_actual_draft_physical_kv_blocks(sizes):
+    class Parent:
+        def set_attn(self, *_args):
+            self.draft_kv_cache_group_ids = [1, 2]
+
+    backend = type("Backend", (), {})
+    factory = Mock(return_value=object())
+    patched_module = SimpleNamespace()
+    cls = load_hook_class(
+        "vllm_ascend/worker/v2/spec_decode/dspark/speculator.py",
+        "AscendDSparkSpeculator",
+        {"set_attn"},
+        Parent,
+        {
+            "set_current_vllm_config": lambda *_a: nullcontext(),
+            "Any": object,
+            "cast": lambda _t, v: v,
+            "AttentionLayerBase": object,
+            "get_layers_from_vllm_config": lambda *_a: {},
+            "_get_graph_update_backend": lambda *_a: backend,
+            "AscendMLABackend": backend,
+            "AscendAttentionBackend": backend,
+            "dflash_speculator": patched_module,
+            "prepare_dflash_inputs_factory": factory,
+            "torch": torch,
+        },
+    )
+    draft = cls()
+    draft.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=32))
+    draft.attn_vllm_config = object()
+    draft._context_slot_mappings = torch.zeros(1, dtype=torch.long)
+    draft.draft_attn_layer_names = set()
+    draft.attn_groups = []
+    cache = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(layer_names=[], kv_cache_spec=SimpleNamespace(block_size=size)) for size in (32, *sizes)
+        ]
+    )
+    if sizes[0] != sizes[1]:
+        with pytest.raises(ValueError, match="physical KV block size"):
+            draft.set_attn(None, cache, None, None, None)
+        factory.assert_not_called()
+    else:
+        draft.set_attn(None, cache, None, None, None)
+        factory.assert_called_once_with(128)
+        assert patched_module.prepare_dflash_inputs is factory.return_value
 
 
 def test_disabled_load_does_not_allocate_or_finalize_offload():

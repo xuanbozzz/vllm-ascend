@@ -1,6 +1,6 @@
 # Exact MoE expert offload: V2 eager and decode ACL graph
 
-Status: single-worker implementation snapshot. Prepared native H2D numerical and performance acceptance is recorded below. Decode ACL graph adds replayed expert loading and capacity filtering. Asynchronous scheduling remains separate work.
+Status: single-worker implementation snapshot. Prepared native H2D and checkpoint-native DSpark numerical and performance acceptance are recorded below. Decode ACL graph adds replayed expert loading and capacity filtering. Asynchronous scheduling remains separate work.
 
 ## Pinned implementation baseline
 
@@ -25,11 +25,24 @@ Expert offload is disabled by default. Enable the draft using the existing Ascen
 }
 ```
 
-The slot count must satisfy `top_k <= num_device_experts < num_experts` for every target routed expert layer. Unknown keys, string booleans, non-integral slot counts, and invalid capacities fail early.
+The slot count must satisfy `top_k <= num_device_experts < num_experts` for every target and enabled draft routed expert layer. Unknown keys, string booleans, non-integral slot counts, and invalid capacities fail early.
 
 The implementation targets the DeepSeek V4 W4A8 MXFP model contract with group size 32. Acceptance uses the locally stored DeepSeek-V4-Flash-0731 checkpoint. Every routed expert layer must use a supported quantization adapter; shared and dense model weights follow their existing paths.
 
 Required settings are V2, `async_scheduling=False`, and single-worker execution with TP/DP/PP/PCP/DCP sizes equal to one. Use `enforce_eager=True` for eager, or compilation mode `NONE` with `FULL_DECODE_ONLY` for ACL graph. Compiled/piecewise or mixed graphs, expert parallelism, EPLB, dual batch overlap, LoRA, sleep mode, online weight reload, generic CPU weight offload, and PD disaggregation are unsupported. Biased experts and sequence-parallel expert execution are also rejected. Use normal `auto`, `safetensors`, or `pt` checkpoint loading; dummy and preprocessed weight-cache loaders are unsupported.
+
+### Checkpoint-native DSpark
+
+The supported speculative configuration is the DeepSeek V4 checkpoint's own DSpark draft, with `max_num_seqs=1`, eager drafting and fixed verification. Other speculative methods, external drafts, draft graphs and adaptive verification remain rejected. For the locally tested 0731 checkpoint, the draft block size is five:
+
+```bash
+--speculative-config '{"method":"dspark","num_speculative_tokens":5,"enforce_eager":true}'
+--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[6]}'
+```
+
+The runner adopts both target and draft expert layers after the parent loader finishes. Each layer keeps its own residency map and prepared host bundle; compatible layers reuse the same full-expert pool. The DSpark proposer owns a separate serialized execution scope because drafting occurs after the target forward. Its query block uses resident slots even when prompt auxiliary states initialize draft KV; profiling and route capacity overflow still use the full pool. Failures invalidate the shared manager, and shutdown releases both sets of layers. Draft input preparation uses the loaded draft KV groups' physical block size, rather than the target's requested block size. This preparation currently requires one physical block size across the draft groups.
+
+Uniform verification descriptors can contain several tokens per request. Capture and dispatch include every verification and padding row in the existing capacity bound. Five draft tokens plus the new target token require at least 36 slots at top-k six for a six-token target graph. Adding the draft also increases model and KV memory; a slot count that fits ordinary decode is not guaranteed to fit DSpark. This integration does not enable LRC, expert prefetch or hot-expert preload.
 
 ## Serving example
 
@@ -40,6 +53,21 @@ bash examples/run_moe_expert_offload.sh /models/DeepSeek-V4-Flash-0731
 ```
 
 The script enables expert offload with 16 resident slots, a fixed 2 GiB KV budget, BF16 KV, and graph candidates `[1, 2, 4]`. Pass extra `vllm serve` arguments to override these example defaults. If BF16 KV is incompatible with the selected environment, append `--kv-cache-dtype fp8` and use the same KV dtype in the numerical reference. The pinned DeepSeek V4 path uses `--block-size 32`. Remove graph compilation settings and add `--enforce-eager` for eager acceptance.
+
+To reproduce the accepted single-card 84-slot DSpark configuration, use the same pinned source versions and CANN 9.2 environment, expose one idle NPU, and run:
+
+```bash
+bash examples/run_moe_expert_offload.sh /models/DeepSeek-V4-Flash-0731 \
+    --kv-cache-dtype fp8 --max-model-len 262144 \
+    --max-num-batched-tokens 2048 --max-num-seqs 1 \
+    --kv-cache-memory-bytes 2415919104 --gpu-memory-utilization 0.97 \
+    --enable-prefix-caching \
+    --additional-config '{"expert_offload_config":{"enabled":true,"num_device_experts":84}}' \
+    --speculative-config '{"method":"dspark","num_speculative_tokens":5,"enforce_eager":true}' \
+    --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[6]}'
+```
+
+This configuration uses FP8 KV, a 2.25 GiB KV budget and a six-token target verification graph. It keeps eager drafting, serialized execution and the default exact offload policy, without LRC or expert prefetch. The benchmark uses 65536 input tokens, 1024 output tokens, five formal requests, concurrency one and an actual 90% prefix-cache hit rate; these are benchmark-client settings rather than server arguments. The checkpoint path must resolve to local disk.
 
 ## Loading and execution
 
@@ -134,5 +162,33 @@ The same 950DT/CANN 9.2 environment and local 0731 checkpoint were tested with 9
 | Mean TTFT | 90.386 s to 12.339 s |
 
 The old and new benchmark request inputs were verified identical by SHA256. All five new TPOT values were 71.800-76.092 ms, so the below-50-ms target was not reached. This is a comparison with the immediately preceding PR01 implementation, not a verified comparison with the historical September 28 DSpark run. The full-model numerical reference for this snapshot uses the preceding eager implementation with the same 96 slots. The physical HBM peak is sampled every 15 seconds, while allocator peaks are worker counters. These performance results do not include DSpark.
+
+### October 13, 2026 DSpark numerical acceptance
+
+The same local checkpoint and environment were tested with 48 slots in both target and draft expert layers, FP8 KV, maximum context 262144 and a fixed 2.25 GiB KV budget. DSpark uses five speculative tokens with eager drafting; target verification uses a six-token decode graph. LRC, expert prefetch and adaptive verification are disabled.
+
+The eager reference forces both target and draft MoE through the reusable complete expert pool. Three serial short/long/short requests, including a 3009-token prompt split into 2048-token chunks, each generated 32 tokens. The offload graph path reproduced all generated tokens and all 34 finite logits tensors bitwise, with maximum absolute error zero (`rtol=atol=1e-3` fixed before comparison). The six-token target graph replayed 30 times. All three generated prefixes also matched the first four greedy tokens saved from the ordinary non-speculative run. This is bounded numerical evidence for this checkpoint, not a full accuracy evaluation or a 96-slot performance result.
+
+The related checks passed 141 expert-offload UTs, 94 runner/quantization UTs and 137 DSpark/speculator UTs. Source formatting and whitespace checks passed.
+
+### October 13, 2026 DSpark performance acceptance
+
+The 96-slot DSpark configuration failed during startup before KV allocation: an additional 768 MiB allocation encountered 67.21 GiB active memory and only 50.18 MiB free. The approved performance configuration uses 84 resident experts in each of the 43 target and three draft MoE layers, five speculative tokens, eager drafting and a six-token target verification graph. Maximum context remains 262144 with FP8 KV and a fixed 2.25 GiB KV budget; LRC, expert prefetch, adaptive verification and asynchronous scheduling remain disabled. The benchmark uses the local disk checkpoint.
+
+| Check | Result |
+| --- | --- |
+| AIS Bench formal requests | 5 successful, each 65536 input and 1024 output tokens, concurrency 1 |
+| Actual prefix-cache hit rate | 90%; 294912 hits / 327680 queried tokens |
+| Mean TPOT | 40.548 ms |
+| Per-request TPOT | 45.921 / 31.839 / 45.691 / 32.487 / 46.801 ms; all below 50 ms |
+| P90 TPOT | 46.449 ms |
+| Mean TTFT / end-to-end latency | 15.886 s / 57.366 s |
+| Loading allocated peak | 63.569 GiB |
+| Allocated after warmup | 63.826 GiB |
+| Benchmark allocated / reserved peak | 64.489 / 65.092 GiB |
+| Sampled physical HBM peak | 83715 / 86016 MiB, including platform overhead |
+| Post-benchmark 84-slot output check | Short/3009-token chunked long/short, 32 tokens each; all match the 48-slot eager full-pool reference |
+
+TPOT was recalculated from the raw AIS timing arrays using `(last_response_time - first_response_time) / (output_tokens - 1)`. DSpark streams multiple accepted tokens per response, so the number of response timestamps is not the output token count. The five prompt SHA256 values match the preceding non-speculative benchmark. That benchmark used 96 slots and a 2 GiB KV budget, so the difference is not a controlled measurement of DSpark alone. The historical September 28 result has not been independently reproduced. The 34-tensor logits comparison used 48 slots; the 84-slot follow-up compares generated text and token strings without logits instrumentation. These checks are bounded numerical evidence rather than a full accuracy evaluation.
 
 Prepared native H2D removes per-miss format conversion and temporary device-to-device copies. Asynchronous scheduling, LRC, prediction, MemFabric, EP, and prefill pipelining remain separate contributions.

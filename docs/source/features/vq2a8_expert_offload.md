@@ -142,6 +142,55 @@ A successful exact-length run establishes execution and length support, not mode
 accuracy on a benchmark dataset. Compare numerical outputs separately using the
 same checkpoint and predeclared tolerances.
 
+For a prefix-cache benchmark, add `--prefix-caching --log-stats` to the server
+command. Engine statistics must be enabled so AISBench can compare the
+`vllm:prefix_cache_queries_total` and `vllm:prefix_cache_hits_total` counters
+before and after the formal requests. Keep prefix warmup outside that interval,
+disable AISBench's additional warmups, and use the same tokenizer for data
+generation and serving. Disable automatic special-token insertion in both
+warmup and formal completion requests when constructing exact token lengths.
+The uncached benchmark above does not establish a prefix-cache hit rate.
+
+The compressed cache groups can require larger hit boundaries than the launcher's
+32-token block size. Report the actual token-weighted hit rate alongside the
+dataset's theoretical rate. An identical prompt repeated twice does not represent
+a 90% cache-hit workload.
+
+Increasing `--num-device-experts` can reduce decode-time expert transfers, but
+consumes memory in each offloaded layer, including the original draft. Retain
+space for the 64K prompt, cached prefixes, prefill pools, graph intermediates and
+runtime workspaces. Compare expert counts with identical formal requests and
+measure performance rather than assuming more resident experts are faster.
+
+On 2026-10-15, AISBench's Prefix Cache plugin validated five sequential requests
+per expert count on the same physical card 4 and development image. Every request
+returned exactly 65,536 input tokens and 1,024 output tokens, with original-format
+DSpark enabled. All three counts returned identical text for the same five inputs.
+Each formal measurement observed 294,912 cached tokens out of 327,680 queried
+tokens: an actual token-weighted hit rate of exactly 90%.
+
+| Resident experts | Mean TTFT (s) | Mean TPOT (ms/token) | Mean request latency (s) |
+| ---: | ---: | ---: | ---: |
+| 84 | 17.15 | 32.3 | 50.15 |
+| 128 | 17.69 | 30.3 | 48.69 |
+| 224 | 15.94 | 14.0 | 30.27 |
+
+For this workload, use `--num-device-experts 224 --prefix-caching --log-stats`
+with the other launch arguments above. Compared with 84 experts, the measured
+mean TPOT decreased by 56.7% and mean request latency decreased by 39.7%.
+These are five-request measurements at concurrency one, not a general throughput
+or model-quality guarantee.
+
+The coarsest compressed hit boundary is 4,096 raw tokens. The generator uses
+that effective alignment while the server retains its 32-token kernel block.
+The five shared prefixes contain 57,344, 61,440, 57,344, 61,440 and 57,344 tokens;
+individual requests therefore have 87.5% or 93.75% theoretical hits. The group
+average is 90%, rather than each request individually having a 90% hit rate.
+AISBench warmup is excluded from the formal counters. The production API does
+not expose `/reset_prefix_cache`; candidate servers restart before warmup, and
+the plugin records its explicit `ASSUME_EMPTY_CACHE` warning. Formal query
+totals and the actual hit rate are checked independently of that warning.
+
 ## Validation status
 
 Windows checks cover isolated contracts and source checks. NPU validation uses

@@ -44,6 +44,12 @@ def parse_args(argv=None):
     parser.add_argument("--num-device-experts", type=int, default=84)
     parser.add_argument("--expert-offload", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prefix-caching", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--log-stats",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable engine statistics and Prometheus cache-hit metrics for benchmarks",
+    )
     parser.add_argument("--prefill-chunk-size", type=int, default=2048)
     parser.add_argument("--kv-cache-mib", type=int, default=1024)
     parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8"), default="auto")
@@ -244,12 +250,13 @@ def build_command(args):
         str(args.memory_fraction),
         "--seed",
         "0",
-        "--disable-log-stats",
         "--generation-config",
         "vllm",
         "--additional-config",
         json.dumps(additional),
     ]
+    if not args.log_stats:
+        command.append("--disable-log-stats")
     command.extend(["--quantization", "vq2a8"])
     if args.draft_model is not None:
         command.extend(

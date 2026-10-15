@@ -283,7 +283,8 @@ def serve_module():
     return module
 
 
-def test_serving_command_keeps_draft_format_and_64k_chunked_prefill(tmp_path):
+@pytest.mark.parametrize("cache_metrics", [False, True])
+def test_serving_command_keeps_draft_format_and_64k_chunked_prefill(tmp_path, cache_metrics):
     target, draft = tmp_path / "target", tmp_path / "draft"
     target.mkdir()
     draft.mkdir()
@@ -293,12 +294,17 @@ def test_serving_command_keeps_draft_format_and_64k_chunked_prefill(tmp_path):
     (target / "model.safetensors.index.json").write_text("{}")
     (draft / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "modelslim"}}))
     module = serve_module()
-    args = module.parse_args(["--model", str(target), "--draft-model", str(draft), "--num-speculative-tokens", "5"])
+    argv = ["--model", str(target), "--draft-model", str(draft), "--num-speculative-tokens", "5"]
+    if cache_metrics:
+        argv.extend(["--prefix-caching", "--log-stats", "--num-device-experts", "128"])
+    args = module.parse_args(argv)
     command = module.build_command(args)
     assert command[command.index("--max-model-len") + 1] == "66560"
     assert command[command.index("--max-num-batched-tokens") + 1] == "2048"
     assert "--enable-chunked-prefill" in command
-    assert "--no-enable-prefix-caching" in command
+    assert ("--enable-prefix-caching" in command) == cache_metrics
+    assert ("--no-enable-prefix-caching" in command) != cache_metrics
+    assert ("--disable-log-stats" in command) != cache_metrics
     compilation = json.loads(command[command.index("--compilation-config") + 1])
     assert compilation["cudagraph_capture_sizes"] == [6]
     speculative = json.loads(command[command.index("--speculative-config") + 1])
@@ -306,4 +312,4 @@ def test_serving_command_keeps_draft_format_and_64k_chunked_prefill(tmp_path):
     assert speculative["enforce_eager"]
     assert speculative["quantization"] == "ascend"
     additional = json.loads(command[command.index("--additional-config") + 1])
-    assert additional["expert_offload_config"] == {"enabled": True, "num_device_experts": 84}
+    assert additional["expert_offload_config"] == {"enabled": True, "num_device_experts": 128 if cache_metrics else 84}

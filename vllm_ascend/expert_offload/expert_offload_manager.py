@@ -39,6 +39,7 @@ class LayerOffloadBinding:
         self.residency = ExpertResidency(self.num_experts, self.num_slots)
         self.manager: ExpertOffloadManager | None = None
         self.resident: dict[str, torch.Tensor] = {}
+        self.graph_staging = {}
 
     def process_weights_after_loading(self, layer) -> None:
         if self.resident:
@@ -61,7 +62,28 @@ class LayerOffloadBinding:
         manager = self.manager
         if manager is None or manager.state is not OffloadState.READY or not manager.executing:
             raise RuntimeError("expert offload layer requires a ready runner-owned execution")
+        if self.device.type == "npu" and torch.npu.is_current_stream_capturing():
+            from .graph import GraphExpertStaging
+
+            key = (tuple(selected_ids.shape), selected_ids.dtype)
+            if key not in self.graph_staging:
+                raise RuntimeError("expert graph staging must be initialized before capture")
+            staging: GraphExpertStaging = self.graph_staging[key]
+            physical_ids = staging.prepare(selected_ids)
+            return (
+                ExpertWeightView(layer, self.resident),
+                physical_ids,
+                manager.get_comm(self, layer.moe_config, self.num_slots),
+            )
         try:
+            if manager.capturing_graphs:
+                from .graph import GraphExpertStaging
+
+                if selected_ids.numel() > self.num_slots:
+                    raise RuntimeError("expert graph shape exceeds resident capacity")
+                key = (tuple(selected_ids.shape), selected_ids.dtype)
+                if key not in self.graph_staging:
+                    self.graph_staging[key] = GraphExpertStaging(self, selected_ids.shape, selected_ids.dtype)
             # One batched synchronization. No scalar device .item() loop.
             logical_ids = selected_ids.detach().to(device="cpu", dtype=torch.long).reshape(-1).tolist()
             plan = self.residency.plan(logical_ids)
@@ -86,11 +108,12 @@ class LayerOffloadBinding:
     def close(self) -> None:
         self.host_store.close()
         self.resident.clear()
+        self.graph_staging.clear()
         self.manager = None
 
 
 class ExpertOffloadManager:
-    """V2 runner-owned serialized eager lifecycle without global state."""
+    """V2 runner-owned serialized eager/graph lifecycle without global state."""
 
     def __init__(self):
         self.state = OffloadState.REGISTERING
@@ -100,6 +123,36 @@ class ExpertOffloadManager:
         self.executing = False
         self.has_prefill = True
         self.is_profile = False
+        self.capturing_graphs = False
+        self.graph_error: Exception | None = None
+        self.graph_load_stream = None
+        self.graph_streams = set()
+
+    def subscribe_graph_stream(self, stream) -> None:
+        if stream not in self.graph_streams:
+            torch.npu._subscribe_report(stream)
+            self.graph_streams.add(stream)
+
+    def check_graph_errors(self) -> None:
+        if self.graph_error is not None:
+            self.state = OffloadState.FAILED
+            raise RuntimeError("expert graph callback failed; rejecting execution output") from self.graph_error
+
+    @contextmanager
+    def graph_capture(self):
+        self.begin_execution()
+        self.has_prefill = False
+        self.capturing_graphs = True
+        failed = True
+        try:
+            yield
+            for device in {binding.device for binding in self.bindings.values()}:
+                torch.npu.current_stream(device).synchronize()
+            self.check_graph_errors()
+            failed = False
+        finally:
+            self.capturing_graphs = False
+            self.finish_execution(failed=failed)
 
     def finalize_loading(self, model) -> None:
         if self.state is not OffloadState.REGISTERING:
@@ -155,6 +208,7 @@ class ExpertOffloadManager:
         failed = True
         try:
             yield
+            self.check_graph_errors()
             failed = False
         finally:
             self.finish_execution(failed=failed)
@@ -171,7 +225,13 @@ class ExpertOffloadManager:
             for device in {binding.device for binding in self.bindings.values()}:
                 if device.type == "npu":
                     torch.npu.current_stream(device).synchronize()
+            if self.graph_load_stream is not None:
+                self.graph_load_stream.synchronize()
+            for stream in self.graph_streams:
+                torch.npu._unsubscribe_report(stream)
         finally:
+            self.graph_streams.clear()
+            self.graph_load_stream = None
             for binding in self.bindings.values():
                 binding.close()
             self.bindings.clear()

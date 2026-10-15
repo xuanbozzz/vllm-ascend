@@ -140,3 +140,105 @@ def test_nz_prefill_pool_refill_preserves_addresses_and_complete_bundle(expert_b
         assert actual[name].data_ptr() == pointers[name]
         assert torch.equal(_physical_bytes(actual[name]), _physical_bytes(expected[name]))
     pool.close()
+
+
+@torch.inference_mode()
+def test_acl_graph_replay_updates_nz_slots_and_rejects_callback_failure(expert_bundle, monkeypatch):
+    from vllm_ascend.expert_offload.expert_offload_manager import ExpertOffloadManager, OffloadState
+    from vllm_ascend.expert_offload.graph import GraphExpertStaging
+    from vllm_ascend.expert_offload.residency import ExpertResidency
+
+    adapter, store = expert_bundle
+    device = torch.device("npu:0")
+    torch.npu.set_device(device)
+    manager = ExpertOffloadManager()
+    manager.state = OffloadState.READY
+    manager.graph_load_stream = torch.npu.Stream(device=device)
+    resident = adapter.materialize(store, [0, 1], device)
+    binding = SimpleNamespace(
+        manager=manager,
+        adapter=adapter,
+        host_store=store,
+        resident=resident,
+        residency=ExpertResidency(NUM_EXPERTS, 2),
+        num_experts=NUM_EXPERTS,
+        device=device,
+        close=lambda: None,
+    )
+    binding.residency.commit(binding.residency.plan([0, 1]))
+    manager.bindings["test"] = binding
+    staging = GraphExpertStaging(binding, (1, 1), torch.int32)
+    ids = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    x = torch.randn(1, HIDDEN_SIZE, generator=torch.Generator().manual_seed(7)).to(device, dtype=torch.bfloat16)
+    full = adapter.materialize(store, range(NUM_EXPERTS), device)
+    store.prepare_native(adapter, resident, device)
+
+    def forbidden_conversion(*args):
+        raise AssertionError("graph replay must not format-cast")
+
+    monkeypatch.setattr(adapter.scheme, "process_weights_after_loading", forbidden_conversion)
+    pointers = {name: tensor.data_ptr() for name, tensor in resident.items()}
+    capture_stream = torch.npu.Stream(device=device)
+    manager.subscribe_graph_stream(capture_stream)
+
+    def forward(weights, scale, hidden, counts):
+        quantized, token_scale = torch_npu.npu_dynamic_mx_quant(hidden, dst_type=torch.float8_e4m3fn)
+        return torch_npu.npu_grouped_matmul(
+            x=[quantized],
+            weight=[weights],
+            scale=None,
+            antiquant_scale=[scale],
+            per_token_scale=[maybe_normalize_mxfp_scale_layout(token_scale)],
+            per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+            split_item=2,
+            group_type=0,
+            group_list=counts,
+            group_list_type=0,
+            x_dtype=torch.float8_e4m3fn,
+            weight_dtype=torch_npu.float4_e2m1fn_x2,
+            output_dtype=torch.bfloat16,
+        )[0]
+
+    try:
+        # Initialize kernel/workspace paths before capture.
+        _gemm(x, resident["w13_weight"], resident["w13_weight_scale"], [1, 1])
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with manager.graph_capture(), torch.npu.graph(graph, stream=capture_stream):
+            physical = staging.prepare(ids)
+            counts = (torch.arange(2, device=device) >= physical.reshape(-1)[0]).to(torch.int64)
+            gate, up = forward(resident["w13_weight"], resident["w13_weight_scale"], x, counts).chunk(2, -1)
+            hidden = torch.nn.functional.silu(gate) * up
+            output = forward(resident["w2_weight"], resident["w2_weight_scale"], hidden, counts)
+        for expert_id in (5, 3, 1, 4, 5):
+            manager.begin_execution()
+            try:
+                ids.fill_(expert_id)
+                graph.replay()  # Replay on the default stream, not capture_stream.
+                torch.npu.current_stream().synchronize()
+                manager.check_graph_errors()
+                expected_counts = [int(i >= expert_id) for i in range(NUM_EXPERTS)]
+                gate, up = _gemm(x, full["w13_weight"], full["w13_weight_scale"], expected_counts).chunk(2, -1)
+                expected = _gemm(
+                    torch.nn.functional.silu(gate) * up, full["w2_weight"], full["w2_weight_scale"], expected_counts
+                )
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                assert {name: tensor.data_ptr() for name, tensor in resident.items()} == pointers
+            finally:
+                manager.finish_execution(failed=manager.graph_error is not None)
+        manager.begin_execution()
+        before = binding.residency.logical_to_physical()
+
+        def fail_copy(*_args, **_kwargs):
+            raise RuntimeError("injected graph transfer failure")
+
+        monkeypatch.setattr(TorchExpertTransfer, "copy_experts", fail_copy)
+        ids.fill_(0)
+        graph.replay()
+        torch.npu.current_stream().synchronize()
+        with pytest.raises(RuntimeError, match="rejecting execution output"):
+            manager.check_graph_errors()
+        assert binding.residency.logical_to_physical() == before
+        assert manager.state is OffloadState.FAILED
+    finally:
+        manager.close()

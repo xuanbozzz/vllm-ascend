@@ -225,6 +225,7 @@ def test_native_loading_prepares_host_storage_before_publishing_residency(monkey
     binding.resident = {}
     binding.num_slots = 2
     binding.device = SimpleNamespace(type="npu")
+    binding.graph_staging = {}
     binding.residency = ExpertResidency(6, 2)
     tensors = {name: object() for name in MXFP4ExpertAdapter.tensor_names}
     binding.adapter = SimpleNamespace(materialize=lambda *args: tensors)

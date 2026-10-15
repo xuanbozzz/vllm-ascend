@@ -54,6 +54,27 @@ def test_defaults_and_disabled_validation():
     cfg.validate_layer(0, 0)
 
 
+@pytest.mark.parametrize("mode", ["NONE", "FULL_DECODE_ONLY"])
+def test_explicit_eager_or_decode_graph_configuration(mode):
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+    vc, ac = make_configs()
+    vc.model_config.enforce_eager = False
+    vc.compilation_config = SimpleNamespace(mode=CompilationMode.NONE, cudagraph_mode=getattr(CUDAGraphMode, mode))
+    ExpertOffloadConfig(enabled=True, num_device_experts=4).validate(vc, ac)
+
+
+@pytest.mark.parametrize("mode", ["PIECEWISE", "FULL", "FULL_AND_PIECEWISE"])
+def test_unsupported_graph_modes_fail_early(mode):
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+    vc, ac = make_configs()
+    vc.model_config.enforce_eager = False
+    vc.compilation_config = SimpleNamespace(mode=CompilationMode.NONE, cudagraph_mode=getattr(CUDAGraphMode, mode))
+    with pytest.raises(ValueError, match="FULL_DECODE_ONLY"):
+        ExpertOffloadConfig(enabled=True, num_device_experts=4).validate(vc, ac)
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -139,12 +160,4 @@ def test_unsupported_weight_mutation(name):
     else:
         ac.eplb_config.dynamic_eplb = True
     with pytest.raises(ValueError):
-        ExpertOffloadConfig(enabled=True, num_device_experts=4).validate(vc, ac)
-
-
-@pytest.mark.parametrize("enforce_eager", [False])
-def test_non_eager_execution_is_rejected(enforce_eager):
-    vc, ac = make_configs()
-    vc.model_config.enforce_eager = enforce_eager
-    with pytest.raises(ValueError, match="enforce_eager"):
         ExpertOffloadConfig(enabled=True, num_device_experts=4).validate(vc, ac)

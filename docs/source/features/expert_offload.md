@@ -1,6 +1,6 @@
-# Exact MoE expert offload: V2 eager
+# Exact MoE expert offload: V2 eager and decode ACL graph
 
-Status: single-worker eager implementation. Asynchronous scheduling remains separate work.
+Status: single-worker implementation snapshot. Prepared native H2D numerical and performance acceptance is recorded below. Decode ACL graph adds replayed expert loading and capacity filtering. Asynchronous scheduling remains separate work.
 
 ## Pinned implementation baseline
 
@@ -29,7 +29,7 @@ The slot count must satisfy `top_k <= num_device_experts < num_experts` for ever
 
 The implementation targets the DeepSeek V4 W4A8 MXFP model contract with group size 32. Acceptance uses the locally stored DeepSeek-V4-Flash-0731 checkpoint. Every routed expert layer must use a supported quantization adapter; shared and dense model weights follow their existing paths.
 
-Required settings are V2, `async_scheduling=False`, and single-worker execution with TP/DP/PP/PCP/DCP sizes equal to one. Use `enforce_eager=True`. Speculative decoding is unsupported. Compiled/piecewise or mixed graphs, expert parallelism, EPLB, dual batch overlap, LoRA, sleep mode, online weight reload, generic CPU weight offload, and PD disaggregation are unsupported. Biased experts and sequence-parallel expert execution are also rejected. Use normal `auto`, `safetensors`, or `pt` checkpoint loading; dummy and preprocessed weight-cache loaders are unsupported.
+Required settings are V2, `async_scheduling=False`, and single-worker execution with TP/DP/PP/PCP/DCP sizes equal to one. Use `enforce_eager=True` for eager, or compilation mode `NONE` with `FULL_DECODE_ONLY` for ACL graph. Compiled/piecewise or mixed graphs, expert parallelism, EPLB, dual batch overlap, LoRA, sleep mode, online weight reload, generic CPU weight offload, and PD disaggregation are unsupported. Biased experts and sequence-parallel expert execution are also rejected. Use normal `auto`, `safetensors`, or `pt` checkpoint loading; dummy and preprocessed weight-cache loaders are unsupported.
 
 ## Serving example
 
@@ -39,7 +39,7 @@ Expose one idle NPU and install the pinned versions before running:
 bash examples/run_moe_expert_offload.sh /models/DeepSeek-V4-Flash-0731
 ```
 
-The script enables eager expert offload with 16 resident slots, a fixed 2 GiB KV budget and BF16 KV. Pass extra `vllm serve` arguments to override compatible example defaults. The pinned DeepSeek V4 path uses `--block-size 32`.
+The script enables expert offload with 16 resident slots, a fixed 2 GiB KV budget, BF16 KV, and graph candidates `[1, 2, 4]`. Pass extra `vllm serve` arguments to override these example defaults. If BF16 KV is incompatible with the selected environment, append `--kv-cache-dtype fp8` and use the same KV dtype in the numerical reference. The pinned DeepSeek V4 path uses `--block-size 32`. Remove graph compilation settings and add `--enforce-eager` for eager acceptance.
 
 ## Loading and execution
 
@@ -57,6 +57,14 @@ The kernels receive an explicit weight view and a private all-gather dispatcher 
 
 The manager is owned by the runner. V2 batch metadata determines prefill versus decode. Executions are serialized; a failed copy or forward invalidates the manager so stale or partially replaced experts cannot be used by another request. Worker shutdown drains and closes offload resources while preserving parent shutdown behavior.
 
+## Decode ACL graph
+
+Capture and dispatch both filter the actual padded descriptors against `num_tokens * top_k <= num_device_experts` in every offloaded layer. This bound includes padding routes; it does not depend on observed expert overlap. With 16 slots and top-k 6, only 1/2-token candidates are captured. A 3-token batch padded to a 4-token candidate selects eager before replay. Prefill and mixed batches remain eager and use the full-expert pool when required.
+
+Each layer owns pinned route and mapping staging for each captured shape, with stable resident weights and device mapping addresses. The graph records `D2H routes -> host callback -> H2D mapping -> both GEMMs`. Every replay computes a new transactional plan. The callback explicitly enters inference mode, selects its device, directly copies the prepared bundle on a separate load stream, and publishes the mapping after successful completion. It never synchronizes the executing graph stream.
+
+The graph manager subscribes the actual NPU capture stream, independent of upstream CUDA stream caching. The runner fences replay after attention updates are submitted and checks callback errors before returning hidden states. A transfer failure invalidates the manager and rejects that output. Shutdown drains work, unsubscribes report streams, and releases staging. Execution remains serialized with asynchronous scheduling disabled.
+
 ## Tests and acceptance
 
 The new CPU tests cover strict configuration, randomized residency conservation, loader completeness and ownership, bundle/view consistency, pool reuse, stable resident addresses, failure invalidation, and lifecycle composition. Hook tests execute isolated bodies from the actual runner, quantization wrapper, and routed-expert source; they do not substitute for importing and exercising the full matching vLLM runner.
@@ -73,7 +81,58 @@ bash format.sh ci
 
 The Windows development workspace has CPU Torch and lacks installed vLLM and Torch NPU. Its isolated test launcher bypasses the plugin package initializer and parent UT bootstrap to run dependency-light tests. Full runner UTs and the repository-wide CI command require the matching development environment.
 
-The one-card 950DT tests use synthetic packed MXFP4 experts and real quantization post-processing and GEMM operators. They verify physical expert blocks, both GEMM outputs, resident addresses and full-pool refill addresses. They do not replace full-model checkpoint acceptance.
+The one-card 950DT tests use synthetic packed MXFP4 experts and the real quantization post-processing and GEMM operators. They verify physical expert blocks, both GEMM outputs, resident addresses, full-pool refill addresses, repeated graph eviction, inference-mode callback buffers, and injected callback failures. They do not replace full-model checkpoint acceptance.
 
+### October 12, 2026 acceptance snapshot
+
+These results describe the preceding synchronous device-copy implementation. Prepared native H2D acceptance is recorded in the October 13 snapshot. The updated one-card tests reject runtime format conversion, assert no temporary device allocation during replacement, and exercise both GEMMs and graph replay.
+
+The snapshot uses one 950DT NPU, the local DeepSeek-V4-Flash-0731 checkpoint, 16 expert slots, BF16 KV, a fixed 2 GiB KV budget, and the pinned source commits above. The CI A5 nightly provides CANN 9.2.0 (`V100R001C25B114`), Torch 2.10.0 and Torch NPU 2.10.0.post4. The installed custom operators were rebuilt against CANN 9.2.
+
+| Check | Result |
+| --- | --- |
+| Expert offload, V2 runner and quantization adapter UTs | 204 passed |
+| Real NPU NZ copy, pool refill and graph replay/failure tests | 3 passed |
+| Captured descriptors, requested `[1, 2, 4]` | Only 1/2-token uniform decode graphs |
+| Full-model request coverage | 3 serial short/long/short, 2 mixed, 4 concurrent; 33 execution steps, 12 graph replays |
+| Numerical reference | 13 logits tensors of shape `[1, 129280]`, finite, bitwise equal, maximum absolute error 0; matching generated text |
+| Loading allocated peak | 23.342 GiB |
+| Allocated after warmup, including fixed KV budget | 23.326 GiB |
+| Runtime allocated peak | 23.513 GiB |
+| Phase transitions | Prefill to decode graph and decode graph to prefill passed |
+| Capacity overflow | Four concurrent requests completed through eager fallback |
+
+The numerical reference stages all 256 experts of each layer through the reusable full-expert pool and uses the same quantization/post-processing. A whole-model fully resident copy does not fit on one card. This reference validates exact expert selection; its memory is not a fully resident baseline. The numerical tolerance was fixed at `rtol=atol=1e-3` before the test; the observed difference is zero. Results apply to this checkpoint/environment and BF16 KV; FP8 KV and asynchronous scheduling are not claimed as validated. No throughput improvement is claimed.
+
+For another NPU/checkpoint pair or a community submission, also run:
+
+- Compare expert outputs and logits with the same fully resident quantized model, using tolerances established before testing.
+- Exercise prefill, chunked prefill, mixed batches, alternating decode routes, capacity overflow, and prefill-to-decode transitions.
+- Verify actual NPU NZ formats and scale strides when transferring individual experts into resident and full-pool tensors.
+- Measure loading peak, persistent allocated/reserved memory, prefill conversion peak, and resulting KV-cache capacity.
+- Report TTFT, inter-token latency, throughput, route synchronization, and H2D/format-conversion cost.
+- Run offload-disabled regressions and the full matching runner/quantization UTs.
+
+### October 13, 2026 native H2D acceptance snapshot
+
+The same 950DT/CANN 9.2 environment and local 0731 checkpoint were tested with 96 resident experts per layer, V2, FP8 KV, a fixed 2 GiB KV budget, 262144 maximum context, 2048-token prefill chunks and a one-token decode graph. LRC, expert prefetch and speculative decoding were disabled in this snapshot.
+
+| Check | Result |
+| --- | --- |
+| Expert offload UTs | 126 passed before the DSpark extension |
+| Real NPU NZ copy, both GEMMs and graph tests | 3 passed |
+| Numerical comparison with preceding eager transfer path | 13 finite logits tensors, bitwise equal, maximum absolute error 0; matching output |
+| Phase transitions | Short/long/short requests, 17 execution steps, 9 graph replays; both prefill/decode transitions passed |
+| Loading allocated peak | 66.180 GiB |
+| Allocated after warmup | 66.166 GiB |
+| Benchmark runtime allocated peak | 66.799 GiB |
+| Benchmark reserved peak | 67.262 GiB |
+| Sampled physical HBM use, including platform overhead | 85912 / 86016 MiB |
+| AIS Bench formal requests | 5 successful, each 65536 input and 1024 output tokens, concurrency 1 |
+| Actual prefix-cache hit rate | 90%; 294912 hits / 327680 queried tokens |
+| Mean TPOT, preceding path to prepared H2D | 355.405 ms to 74.272 ms, 4.79 times faster |
+| Mean TTFT | 90.386 s to 12.339 s |
+
+The old and new benchmark request inputs were verified identical by SHA256. All five new TPOT values were 71.800-76.092 ms, so the below-50-ms target was not reached. This is a comparison with the immediately preceding PR01 implementation, not a verified comparison with the historical September 28 DSpark run. The full-model numerical reference for this snapshot uses the preceding eager implementation with the same 96 slots. The physical HBM peak is sampled every 15 seconds, while allocator peaks are worker counters. These performance results do not include DSpark.
 
 Prepared native H2D removes per-miss format conversion and temporary device-to-device copies. Asynchronous scheduling, LRC, prediction, MemFabric, EP, and prefill pipelining remain separate contributions.

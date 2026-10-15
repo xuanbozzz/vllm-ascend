@@ -40,7 +40,17 @@ class ExpertOffloadConfig:
         if not vllm_config.use_v2_model_runner:
             raise ValueError("expert offload requires Model Runner V2")
         if not vllm_config.model_config.enforce_eager:
-            raise ValueError("expert offload requires enforce_eager=True")
+            from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+            compilation = vllm_config.compilation_config
+            if compilation.mode != CompilationMode.NONE or compilation.cudagraph_mode not in (
+                CUDAGraphMode.NONE,
+                CUDAGraphMode.FULL_DECODE_ONLY,
+            ):
+                raise ValueError(
+                    "expert offload graph requires compilation mode=NONE and cudagraph_mode=FULL_DECODE_ONLY "
+                    "(or NONE for eager); compiled/piecewise and mixed graphs are unsupported"
+                )
         if vllm_config.model_config.enable_sleep_mode:
             raise ValueError("expert offload PR01 does not support sleep mode")
         if vllm_config.scheduler_config.async_scheduling:

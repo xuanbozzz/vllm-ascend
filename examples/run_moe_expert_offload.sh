@@ -14,6 +14,6 @@ exec vllm serve "$model_path" \
     --no-async-scheduling --max-model-len 2048 \
     --max-num-batched-tokens 512 --max-num-seqs 4 --enable-chunked-prefill \
     --kv-cache-memory-bytes 2147483648 --seed 0 \
-    --enforce-eager \
+    --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4]}' \
     --additional-config '{"expert_offload_config":{"enabled":true,"num_device_experts":16}}' \
     "$@"

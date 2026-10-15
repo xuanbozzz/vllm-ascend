@@ -44,6 +44,52 @@ def load_hook_class(path, class_name, methods, parent, namespace):
     return namespace[class_name]
 
 
+def test_graph_manager_filters_padded_candidates_and_subscribes_actual_npu_stream():
+    from vllm.config.compilation import CUDAGraphMode
+
+    descs = [SimpleNamespace(num_tokens=n, uniform_token_count=1) for n in (1, 2, 4)]
+    cached_stream, actual_stream = object(), object()
+
+    class Parent:
+        def __init__(self, *args, **kwargs):
+            self.device = args[1]
+            self._capture_descs = {CUDAGraphMode.FULL: descs}
+            self._candidates = {(n, 0): [desc] for n, desc in zip((1, 2, 3), descs)}
+
+        def needs_capture(self):
+            return any(self._capture_descs.values())
+
+        def _capture_stream(self, desc):
+            return cached_stream
+
+    manager = ExpertOffloadManager()
+    manager.bindings["layer"] = SimpleNamespace(top_k=6, num_slots=16)
+    manager.subscribe_graph_stream = Mock()
+    runner = SimpleNamespace(expert_offload_manager=manager, update_stream=object())
+    graph_params = Mock()
+    cls = load_hook_class(
+        "vllm_ascend/worker/v2/aclgraph_utils.py",
+        "ModelAclGraphManager",
+        {"__init__", "_capture_stream"},
+        Parent,
+        {
+            "torch": SimpleNamespace(
+                npu=SimpleNamespace(Stream=Mock(), current_stream=Mock(return_value=actual_stream))
+            ),
+            "collect_sorted_captured_token_sizes": lambda groups: sorted(
+                d.num_tokens for ds in groups.values() for d in ds
+            ),
+            "set_graph_params": graph_params,
+        },
+    )
+    graph = cls(object(), "npu:0", CUDAGraphMode.FULL_DECODE_ONLY, 1, runner)
+    assert graph.capture_sizes == [1, 2]
+    assert graph._candidates[(3, 0)] == []  # Three actual tokens round up to four.
+    graph_params.assert_called_once_with([1, 2])
+    assert graph._capture_stream(descs[0]) is actual_stream
+    manager.subscribe_graph_stream.assert_called_once_with(actual_stream)
+
+
 def make_runner(*, manager=None, fail_load=False, fail_forward=False, has_prefill=False):
     events: list[object] = []
 

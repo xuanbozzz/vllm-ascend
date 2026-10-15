@@ -17,7 +17,7 @@ class ExpertTensorSpec:
 class PreparedExpertTensor:
     """Pinned physical bytes plus the native tensor layout they encode."""
 
-    data: torch.Tensor
+    data: torch.Tensor | tuple[torch.Tensor, ...]
     shape: tuple[int, ...]
     stride: tuple[int, ...]
     dtype: torch.dtype

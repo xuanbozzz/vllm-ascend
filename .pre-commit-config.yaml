@@ -13,12 +13,16 @@ repos:
   hooks:
   - id: ruff-check
     args: [--output-format, github, --fix]
+    # Imported operator sources are tracked by SOURCE_MANIFEST.json.
+    exclude: ^csrc/mixed_w2w4_moe_ffn/
   - id: ruff-format
+    exclude: ^csrc/mixed_w2w4_moe_ffn/
 
 - repo: https://github.com/codespell-project/codespell
   rev: v2.4.1
   hooks:
     - id: codespell
+      exclude: ^csrc/mixed_w2w4_moe_ffn/
       args: [
         --toml, pyproject.toml,
         '--skip', 'tests/prompts/**,./benchmarks/sonnet.txt,*tests/lora/data/**,build/**,./vllm_ascend.egg-info/**,typos.toml',
@@ -119,6 +123,7 @@ repos:
     language: python
     types: [python]
     additional_dependencies: [regex]
+    exclude: ^csrc/mixed_w2w4_moe_ffn/
   - id: check-boolean-context-manager
     name: Check for boolean ops in with-statements
     entry: python3 tools/check_boolean_context_manager.py
@@ -129,6 +134,7 @@ repos:
     entry: python3 tools/check_long_functions.py
     language: system
     types: [python]
+    exclude: ^csrc/mixed_w2w4_moe_ffn/
   - id: check-symbolic-meta
     name: Check symbolic shapes in meta kernels
     entry: python3 tools/check_symbolic_meta.py

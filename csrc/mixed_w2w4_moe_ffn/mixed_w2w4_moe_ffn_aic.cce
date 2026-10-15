@@ -1,0 +1,110 @@
+#ifdef __CCE_KT_TEST__
+#define __aicore__
+#else
+#define __aicore__ [aicore]
+#endif
+
+#include <cstdint>
+#include "kernel_operator.h"
+#include "kernel_tensor.h"
+#include "mixed_tiling.h"
+#include "mixed_route.h"
+
+#define MAT_FP4_COMPONENT_ONLY 1
+
+namespace GateW2Aic {
+#include "components/gate_w2/gate_w2_aic_impl.h"
+} // namespace GateW2Aic
+
+namespace GateW4Aic {
+#include "components/gate_w4/gate_w4_aic_impl.h"
+} // namespace GateW4Aic
+
+namespace DownW2Aic {
+#include "components/down_w2/down_w2_aic_impl.h"
+} // namespace DownW2Aic
+
+namespace DownW4Aic {
+#include "components/down_w4/down_w4_aic_impl.h"
+} // namespace DownW4Aic
+
+#undef MAT_FP4_COMPONENT_ONLY
+
+#ifdef __DAV_C310_CUBE__
+namespace {
+
+constexpr uint64_t kMixedIntraArriveEvent = 6;
+constexpr uint64_t kMixedIntraReleaseEvent = 7;
+
+// Rendezvous only the one AIC and its two sibling AIVs.  Component process()
+// has already drained its pipe flags; this handshake prevents either side
+// from reusing the same L1/UB intra-block event ids in the next component
+// before all three local participants have left the previous component.
+__aicore__ inline void MixedComponentBarrierAic()
+{
+    wait_intra_block(PIPE_MTE1, kMixedIntraArriveEvent);
+    wait_intra_block(PIPE_MTE1, kMixedIntraArriveEvent + 16);
+    set_intra_block(PIPE_MTE1, kMixedIntraReleaseEvent);
+    set_intra_block(PIPE_MTE1, kMixedIntraReleaseEvent + 16);
+}
+
+} // namespace
+
+extern "C" __global__ __aicore__ void mixed_w2w4_moe_ffn_mix_aic(
+    uint64_t g, uint64_t k, uint64_t n, uint64_t d,
+    __gm__ void *group_list, __gm__ void *a, __gm__ void *a_scale,
+    __gm__ void *gateup_w, __gm__ void *gateup_table,
+    __gm__ void *down_w, __gm__ void *down_table,
+    __gm__ void *scale_upgate, __gm__ void *scale_down,
+    __gm__ void *is_expert_w4, __gm__ void *is_down_w4,
+    __gm__ void *h, __gm__ void *h_scale, __gm__ void *c,
+    __gm__ void *tiling)
+{
+    __gm__ uint8_t *tiling_base = (__gm__ uint8_t *)tiling;
+    __gm__ MixedTilingHeader *mixed_header = (__gm__ MixedTilingHeader *)tiling;
+    const uint64_t stage_mask = mixed_header->stage_mask;
+
+    if ((stage_mask & kMixedStageGateW2) != 0) {
+        GateW2Aic::MatFP4 gate_w2;
+        gate_w2.Init(g, k, n, group_list, a, a_scale, gateup_w, gateup_table,
+                     scale_upgate, h, h_scale, tiling_base + kMixedGateW2TilingOffset,
+                     is_expert_w4);
+        gate_w2.process();
+    }
+
+    if ((stage_mask & kMixedStageGateMask) == kMixedStageGateMask) {
+        MixedComponentBarrierAic();
+    }
+    if ((stage_mask & kMixedStageGateW4) != 0) {
+        GateW4Aic::MatFP4 gate_w4;
+        gate_w4.Init(g, k, n, group_list, a, a_scale, gateup_w, gateup_table,
+                     h, h_scale, tiling_base + kMixedGateW4TilingOffset,
+                     is_expert_w4);
+        gate_w4.process();
+    }
+
+    // Down N shards consume H columns produced by any Gate N shard. A
+    // standalone stage has no such dependency and needs no full-core barrier.
+    // stage_mask is uniform across all AIC/AIV participants.
+    if ((stage_mask & kMixedStageGateMask) != 0 && (stage_mask & kMixedStageDownMask) != 0) {
+        AscendC::SyncAll<false>();
+    }
+
+    if ((stage_mask & kMixedStageDownW2) != 0) {
+        DownW2Aic::MatFP4 down_w2;
+        down_w2.Init(g, n / 2, d, group_list, h, h_scale, down_w, down_table,
+                     scale_down, c, tiling_base + kMixedDownW2TilingOffset, is_down_w4);
+        down_w2.process();
+    }
+
+    if ((stage_mask & kMixedStageDownMask) == kMixedStageDownMask) {
+        MixedComponentBarrierAic();
+    }
+    if ((stage_mask & kMixedStageDownW4) != 0) {
+        DownW4Aic::MatFP4 down_w4;
+        down_w4.Init(g, n / 2, d, group_list, h, h_scale, down_w, down_table,
+                     c, tiling_base + kMixedDownW4TilingOffset, is_down_w4);
+        down_w4.process();
+    }
+}
+#endif

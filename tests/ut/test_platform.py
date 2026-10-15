@@ -726,7 +726,9 @@ class TestNPUPlatform(TestBase):
         mock_adapt_patch.assert_called_once_with(is_global_patch=True)
 
         self.assertTrue(ASCEND_QUANTIZATION_METHOD in mock_action.choices)
-        self.assertEqual(len(mock_action.choices), 3)  # original 2 + ascend
+        self.assertEqual(mock_action.choices.count(ASCEND_QUANTIZATION_METHOD), 1)
+        self.assertEqual(mock_action.choices.count("vq2a8"), 1)
+        self.assertEqual(len(mock_action.choices), 4)
         self.assertIn("int8", dtype_action.choices)
         self.assertIn("mxfp8", dtype_action.choices)
         self.assertEqual(dtype_action.choices.count("auto"), 1)
@@ -759,7 +761,9 @@ class TestNPUPlatform(TestBase):
         self.platform.pre_register_and_update(mock_parser)
 
         mock_adapt_patch.assert_called_once_with(is_global_patch=True)
-        self.assertEqual(len(mock_action.choices), 2)
+        self.assertEqual(mock_action.choices.count(ASCEND_QUANTIZATION_METHOD), 1)
+        self.assertEqual(mock_action.choices.count("vq2a8"), 1)
+        self.assertEqual(len(mock_action.choices), 3)
 
     def test_apply_config_platform_defaults_sets_ascend_default_max(self):
         test_cases = [

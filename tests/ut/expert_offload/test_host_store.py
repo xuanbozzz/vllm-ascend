@@ -105,10 +105,18 @@ def test_native_pool_allocation_uses_only_one_raw_prototype(monkeypatch):
         assert tensor.stride() == destination[name].stride()
 
 
-def test_prepared_bytes_roundtrip_into_transposed_slots_without_conversion(monkeypatch):
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("pageable", [False, True])
+def test_prepared_bytes_roundtrip_into_transposed_slots_without_conversion(monkeypatch, chunked, pageable):
+    if chunked:
+        monkeypatch.setattr("vllm_ascend.expert_offload.host_store.MAX_PINNED_ALLOCATION_BYTES", 24)
     store, adapter, destination, calls = preparation_double(monkeypatch)
     expected = store.tensors["w13_weight"][[2, 1]].transpose(-1, -2).clone()
     store.prepare_native(adapter, destination, "cpu")
+    assert isinstance(store.prepared["w13_weight"].data, tuple) == chunked
+    staging = torch.empty(16, dtype=torch.uint8, pin_memory=True)
+    if pageable:
+        store.transfer_staging = staging
     calls.clear()
 
     def memcpy_async(dst, capacity, src, size, direction, stream):
@@ -119,7 +127,7 @@ def test_prepared_bytes_roundtrip_into_transposed_slots_without_conversion(monke
 
     monkeypatch.setitem(sys.modules, "acl", SimpleNamespace(rt=SimpleNamespace(memcpy_async=memcpy_async)))
     monkeypatch.setattr(torch, "device", lambda device: SimpleNamespace(type="npu"))
-    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: not pageable or self.data_ptr() == staging.data_ptr())
     monkeypatch.setattr(
         torch,
         "npu",
@@ -128,6 +136,33 @@ def test_prepared_bytes_roundtrip_into_transposed_slots_without_conversion(monke
         ),
     )
     TorchExpertTransfer.copy_experts(adapter, store, destination, [(2, 0), (1, 1)], "npu:0")
-    assert calls == ["H2D"] * 8 + ["sync"]
+    if pageable:
+        assert calls.count("H2D") == 16
+        assert calls.count("sync") == 12
+        assert calls[-1] == "sync"
+    else:
+        assert calls == ["H2D"] * 8 + ["sync"]
     for tensor in destination.values():
         torch.testing.assert_close(tensor, expected)
+
+
+def test_host_pin_exhaustion_falls_back_once_to_owned_pageable_bytes(monkeypatch):
+    from vllm_ascend.expert_offload import host_store
+
+    monkeypatch.setattr(host_store, "_pin_native_bytes", True)
+    original_empty, calls = torch.empty, []
+
+    def empty(*args, **kwargs):
+        pinned = kwargs.pop("pin_memory", False)
+        calls.append(pinned)
+        if pinned:
+            raise torch.OutOfMemoryError("host pin budget exhausted")
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+    with pytest.warns(RuntimeWarning, match="reserved pinned transfer staging"):
+        first = host_store.allocate_native_expert_bytes(2, 8)
+    second = host_store.allocate_native_expert_bytes(2, 8)
+    assert calls == [True, False, False]
+    assert first.shape == second.shape == (2, 8)
+    assert first.data_ptr() != second.data_ptr()

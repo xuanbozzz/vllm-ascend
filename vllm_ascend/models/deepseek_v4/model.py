@@ -79,6 +79,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
@@ -1058,6 +1059,13 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         self.config = config
         self.quant_config = quant_config
 
+        if getattr(quant_config, "is_gs32", False) or get_current_hardware_profile().supports(
+            HardwareCapability.DSV4_COMPRESSED_CACHE
+        ):
+            from vllm_ascend.models.deepseek_v4.native_ops import require_deepseek_v4_native_ops
+
+            require_deepseek_v4_native_ops()
+
         self.model = self.model_cls(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1191,6 +1199,22 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 ):
                     raise ValueError(f"Hash table {name} refers to experts absent from the VQ2A8 checkpoint.")
                 return
+            if (
+                getattr(self.quant_config, "is_gs32", False)
+                and value.dtype == torch.float32
+                and param.dtype == torch.bfloat16
+                and name.endswith(
+                    (
+                        ".norm.weight",
+                        ".q_norm.weight",
+                        ".kv_norm.weight",
+                        ".input_layernorm.weight",
+                        ".post_attention_layernorm.weight",
+                    )
+                )
+            ):
+                # Preserve checkpoint FP32 norms and Parameter loader metadata.
+                param.data = param.data.float()
             if value.dtype != param.dtype:
                 widen = (
                     value.dtype == torch.bfloat16

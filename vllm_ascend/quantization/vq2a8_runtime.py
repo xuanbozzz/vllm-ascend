@@ -7,6 +7,7 @@ import torch
 class VQ2A8Runtime:
     def __init__(self, model, device, expected_layers=None):
         self.owners = []
+        self.layer_indices = []
         layer_indices = set()
         for layer in model.modules():
             weights = getattr(layer, "vq2a8_weights", None)
@@ -22,6 +23,7 @@ class VQ2A8Runtime:
                 variants.extend(getattr(binding.adapter, "banks", {}).values())
             variants = tuple({id(value): value for value in variants}.values())
             self.owners.append(variants)
+            self.layer_indices.append(index)
         if expected_layers is not None and layer_indices != set(expected_layers):
             raise RuntimeError("VQ validity must cover every configured target expert layer")
         self.validity = torch.zeros(len(self.owners), dtype=torch.bool, device=device)
@@ -40,4 +42,5 @@ class VQ2A8Runtime:
 
     def check(self):
         if self.owners and not bool(self.validity.all()):
-            raise RuntimeError("VQ2A8 forward failed validity checks; rejecting execution output")
+            failed = [index for index, valid in zip(self.layer_indices, self.validity.cpu().tolist()) if not valid]
+            raise RuntimeError(f"VQ2A8 forward failed validity checks in layers {failed}; rejecting execution output")

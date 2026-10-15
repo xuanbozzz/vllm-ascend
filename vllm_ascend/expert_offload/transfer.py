@@ -1,13 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import ctypes
+from contextlib import nullcontext
+from threading import Lock
+
 import torch
 
 ACL_MEMCPY_HOST_TO_DEVICE = 1
+_host_staging = None
+_host_staging_lock = Lock()
 
 
 class TorchExpertTransfer:
     """Batch native H2D copies on the caller's stream, fencing before publication."""
+
+    @staticmethod
+    def reserve_host_staging():
+        global _host_staging
+        if _host_staging is None:
+            _host_staging = torch.empty(64 * 1024**2, dtype=torch.uint8, device="cpu", pin_memory=True)
+        return _host_staging
 
     @staticmethod
     def copy_experts(adapter, host_store, destination, loads, device) -> None:
@@ -21,6 +34,7 @@ class TorchExpertTransfer:
 
             if set(host_store.prepared) != set(destination):
                 raise RuntimeError("incomplete prepared expert transfer bundle")
+            staging = getattr(host_store, "transfer_staging", None)
             # Validate the entire batch before touching any resident storage.
             copies = [
                 TorchExpertTransfer._host_copy_parameters(
@@ -29,22 +43,44 @@ class TorchExpertTransfer:
                     host_store.rows[expert_id] if hasattr(host_store, "rows") else expert_id,
                     slot,
                     torch_npu,
+                    allow_pageable=staging is not None,
                 )
                 for expert_id, slot in loads
                 for name, prepared in host_store.prepared.items()
             ]
             stream = torch.npu.current_stream(device)
-            try:
-                for dst_ptr, src_ptr, size in copies:
-                    error = acl.rt.memcpy_async(
-                        dst_ptr, size, src_ptr, size, ACL_MEMCPY_HOST_TO_DEVICE, stream.npu_stream
-                    )
-                    if error:
-                        raise RuntimeError(f"asynchronous expert host copy failed: ACL error {error}")
-            finally:
-                # Also drain partially submitted batches on failure. Host bytes
-                # remain owned until completion; callers publish maps afterwards.
-                stream.synchronize()
+            if any(not pinned for _, _, _, pinned in copies) and (
+                staging.device.type != "cpu"
+                or staging.dtype != torch.uint8
+                or not staging.is_contiguous()
+                or not staging.is_pinned()
+                or staging.numel() < 1
+            ):
+                raise ValueError("pageable expert transfer requires valid reserved pinned staging")
+            with _host_staging_lock if staging is not None else nullcontext():
+                offset = 0
+                try:
+                    for dst_ptr, src_ptr, size, pinned in copies:
+                        copied = 0
+                        while copied < size:
+                            count, source = size - copied, src_ptr + copied
+                            if not pinned:
+                                if offset == staging.numel():
+                                    stream.synchronize()
+                                    offset = 0
+                                count = min(count, staging.numel() - offset)
+                                source = staging.data_ptr() + offset
+                                ctypes.memmove(source, src_ptr + copied, count)
+                                offset += count
+                            error = acl.rt.memcpy_async(
+                                dst_ptr + copied, count, source, count, ACL_MEMCPY_HOST_TO_DEVICE, stream.npu_stream
+                            )
+                            if error:
+                                raise RuntimeError(f"asynchronous expert host copy failed: ACL error {error}")
+                            copied += count
+                finally:
+                    # Drain before publishing maps or overwriting staged bytes.
+                    stream.synchronize()
             return
 
         # CPU contract tests use the exact scheme without NPU native storage.
@@ -58,7 +94,7 @@ class TorchExpertTransfer:
                 destination[name][slot].copy_(tensor[0])
 
     @staticmethod
-    def _host_copy_parameters(destination, prepared, expert_id, slot, torch_npu):
+    def _host_copy_parameters(destination, prepared, expert_id, slot, torch_npu, *, allow_pageable=False):
         if (
             destination.device != prepared.device
             or destination.dtype != prepared.dtype
@@ -70,22 +106,30 @@ class TorchExpertTransfer:
             raise ValueError("incompatible expert physical layouts")
         if type(slot) is not int or not 0 <= slot < destination.shape[0]:
             raise ValueError("expert destination slot is out of range")
-        if type(expert_id) is not int or not 0 <= expert_id < prepared.data.shape[0]:
+        data = prepared.data
+        num_experts = len(data) if isinstance(data, tuple) else data.shape[0]
+        if type(expert_id) is not int or not 0 <= expert_id < num_experts:
             raise ValueError("logical expert is out of range")
         size = prepared.expert_bytes
+        if isinstance(data, tuple):
+            host = data[expert_id]
+            host_shape, host_offset = (size,), 0
+        else:
+            host = data
+            host_shape, host_offset = (num_experts, size), expert_id * size
         storage = destination.untyped_storage()
         if (
             size <= 0
             or int(torch_npu.get_storage_size(destination)) * destination.element_size() != size * destination.shape[0]
             or storage.nbytes() < size * destination.shape[0]
-            or prepared.data.device.type != "cpu"
-            or prepared.data.dtype != torch.uint8
-            or prepared.data.shape[1:] != (size,)
-            or not prepared.data.is_contiguous()
-            or not prepared.data.is_pinned()
+            or host.device.type != "cpu"
+            or host.dtype != torch.uint8
+            or tuple(host.shape) != host_shape
+            or not host.is_contiguous()
+            or (not allow_pageable and not host.is_pinned())
         ):
             raise ValueError("expert physical storage does not contain uniform pinned bounded blocks")
-        return storage.data_ptr() + slot * size, prepared.data.data_ptr() + expert_id * size, size
+        return storage.data_ptr() + slot * size, host.data_ptr() + host_offset, size, host.is_pinned()
 
     @staticmethod
     def _physical_copy_parameters(destination, source, slot, torch_npu):

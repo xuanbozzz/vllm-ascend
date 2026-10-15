@@ -266,8 +266,13 @@ def test_native_loading_prepares_host_storage_before_publishing_residency(monkey
         if fail_preparation:
             raise RuntimeError("native preparation failed")
 
+    def finalize(*args, pin_memory):
+        # Raw W4 is temporary: only the final native transfer bytes are pinned.
+        assert not pin_memory
+        events.append("finalize")
+
     binding.host_store = SimpleNamespace(
-        finalize=lambda *args, **kwargs: events.append("finalize"),
+        finalize=finalize,
         prepare_native=prepare,
         close=lambda: events.append("close"),
     )

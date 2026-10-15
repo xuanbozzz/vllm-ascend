@@ -304,6 +304,6 @@ def test_serving_command_keeps_draft_format_and_64k_chunked_prefill(tmp_path):
     speculative = json.loads(command[command.index("--speculative-config") + 1])
     assert speculative["model"] == str(draft.resolve())
     assert speculative["enforce_eager"]
-    assert "quantization" not in speculative
+    assert speculative["quantization"] == "ascend"
     additional = json.loads(command[command.index("--additional-config") + 1])
     assert additional["expert_offload_config"] == {"enabled": True, "num_device_experts": 84}

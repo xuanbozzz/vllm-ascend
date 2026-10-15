@@ -2134,3 +2134,79 @@ def test_tq_groups_without_a_dsa_builder_skip_the_formatted_mapping(for_capture,
         assert "formatted_slot_mapping" not in build_call.call_args.kwargs
         # A group without a DSA builder keeps its lazy geometry untouched.
         assert builder.tq_group_block_sizes is None
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_gs32_native_cache_pages_alias_backing_and_keep_trailing_padding(compact):
+    from vllm_ascend.worker.v2.attn_utils import _view_dsv4_cache
+
+    blocks, block_size, head_size = 3, 2, 4
+    page_bytes = block_size * head_size * 2 + 16
+    raw = torch.full((blocks * page_bytes,), -7, dtype=torch.int8)
+    spec = SimpleNamespace(
+        page_size_bytes=page_bytes,
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.bfloat16,
+        scale_dim=0,
+    )
+    backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
+    (cache,) = _view_dsv4_cache(raw, spec, backend, SimpleNamespace(num_blocks=blocks), compact_native_pages=compact)
+    assert cache.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+    assert cache.is_contiguous() == compact
+    if compact:
+        cache.view(-1, 1, head_size)[block_size].fill_(1)
+        torch.testing.assert_close(cache[1, 0], torch.ones_like(cache[1, 0]))
+        used_bytes = cache.numel() * cache.element_size()
+        assert (raw[used_bytes:] == -7).all()
+
+
+def test_gs32_planner_keeps_target_and_draft_native_pages_disjoint_within_budget(monkeypatch):
+    from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+        _ascend_max_memory_usage_bytes_from_groups,
+        _ascend_pool_bytes_per_block,
+    )
+
+    names = ["model.layers.0.attn", "model.layers.1.attn", "mtp.0.attn"]
+    specs = [
+        AscendMLAAttentionSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=head,
+            dtype=torch.bfloat16,
+            model_version="deepseek_v4",
+            page_size_padded=128,
+        )
+        for head in (8, 4, 8)
+    ]
+    groups = [
+        KVCacheGroupSpec(layer_names=[name], kv_cache_spec=UniformTypeKVCacheSpecs.from_specs({name: spec}))
+        for name, spec in zip(names, specs)
+    ]
+    config = SimpleNamespace(
+        quant_config=SimpleNamespace(is_gs32=True),
+        additional_config={},
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(compress_ratios=[0, 0])),
+        kv_transfer_config=None,
+    )
+    monkeypatch.setattr("vllm_ascend.patch.platform.patch_kv_cache_utils.may_override_num_blocks", lambda _, n: n)
+    blocks, descriptors = _get_kv_cache_config_deepseek_v4_main(config, groups, 4096)
+    assert blocks == 12
+    assert _ascend_pool_bytes_per_block(groups) == 320
+    monkeypatch.setattr(UniformTypeKVCacheSpecs, "max_memory_usage_pages", lambda self, cfg: 3)
+    # All three groups consume global block IDs, each backed in every private
+    # layer region. Weighted per-group page bytes would understate admission.
+    assert _ascend_max_memory_usage_bytes_from_groups(config, groups) == 9 * 320
+    assert {descriptor.size for descriptor in descriptors} == {blocks * 320}
+    assert blocks * 320 <= 4096
+    assert all(group.kv_cache_spec.kv_cache_specs[name].page_size_padded is None for group, name in zip(groups, names))
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", lambda n, *_: torch.zeros(n, dtype=torch.int8))
+    cache_config = KVCacheConfig(num_blocks=blocks, kv_cache_tensors=descriptors, kv_cache_groups=groups)
+    raw = attn_utils._allocate_kv_cache(cache_config, {}, torch.device("cpu"))
+    assert len({value.untyped_storage().data_ptr() for value in raw.values()}) == 1
+    for name in names:
+        raw[name].fill_(1)
+        assert all(not raw[other].any() for other in names if other != name)
+        raw[name].zero_()

@@ -1,0 +1,7 @@
+*.o
+/mixed_w2w4_moe_ffn_host
+/input/
+/output/
+/results/
+/prof*/
+/__pycache__/

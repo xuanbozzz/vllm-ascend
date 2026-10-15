@@ -807,8 +807,16 @@ def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
 
     # ==================== 6. Speculative Config ====================
     if vllm_config.speculative_config:
-        # Ascend automatically inherits main model quantization
-        if getattr(vllm_config.speculative_config, "quantization", None) is not None:
+        # A VQ target uses a separately loaded original-format DSpark checkpoint.
+        # Resetting its explicit quantizer here revalidates the draft as VQ.
+        separate_dspark_quantization = (
+            getattr(vllm_config.model_config, "quantization", None) == "vq2a8"
+            and getattr(vllm_config.speculative_config, "method", None) == "dspark"
+        )
+        if (
+            getattr(vllm_config.speculative_config, "quantization", None) is not None
+            and not separate_dspark_quantization
+        ):
             logger.warning(
                 "Speculative quantization is set but Ascend automatically uses "
                 "the main model's quantization method. "

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import warnings
 from functools import wraps
 
 import torch
@@ -9,6 +10,37 @@ from .transfer import TorchExpertTransfer
 from .types import ExpertTensorSpec, PreparedExpertTensor
 
 ACL_MEMCPY_DEVICE_TO_HOST = 2
+MAX_PINNED_ALLOCATION_BYTES = 64 * 1024**2
+_pin_native_bytes = True
+
+
+def _allocate_host_bytes(shape):
+    global _pin_native_bytes
+    if _pin_native_bytes:
+        try:
+            return torch.empty(shape, dtype=torch.uint8, device="cpu", pin_memory=True)
+        except torch.OutOfMemoryError:
+            _pin_native_bytes = False
+            warnings.warn(
+                "Native expert host pin budget exhausted; using pageable bytes with reserved pinned transfer staging.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    return torch.empty(shape, dtype=torch.uint8, device="cpu")
+
+
+def allocate_native_expert_bytes(num_experts: int, expert_bytes: int):
+    # Large locked allocations can fail under checkpoint page-cache pressure
+    # even with ample reclaimable RAM. Each expert is an independent transfer,
+    # so keep large banks in bounded allocations without changing their bytes.
+    if num_experts * expert_bytes > MAX_PINNED_ALLOCATION_BYTES:
+        rows_per_block = max(1, MAX_PINNED_ALLOCATION_BYTES // expert_bytes)
+        return tuple(
+            row
+            for start in range(0, num_experts, rows_per_block)
+            for row in _allocate_host_bytes((min(rows_per_block, num_experts - start), expert_bytes)).unbind()
+        )
+    return _allocate_host_bytes((num_experts, expert_bytes))
 
 
 class HostExpertStore:
@@ -87,7 +119,7 @@ class HostExpertStore:
                 _, _, size = TorchExpertTransfer._physical_copy_parameters(destination[name], tensor, 0, torch_npu)
                 if expert_id == 0:
                     prepared[name] = PreparedExpertTensor(
-                        data=torch.empty((self.num_experts, size), dtype=torch.uint8, device="cpu", pin_memory=True),
+                        data=allocate_native_expert_bytes(self.num_experts, size),
                         shape=tuple(tensor.shape[1:]),
                         stride=tuple(tensor.stride()),
                         dtype=tensor.dtype,

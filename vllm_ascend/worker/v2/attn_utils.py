@@ -732,6 +732,8 @@ def _view_dsv4_cache(
     attn_backend: AttentionBackend,
     kv_cache_config: KVCacheConfig,
     page_stride: int | None = None,
+    *,
+    compact_native_pages: bool = False,
 ) -> list[torch.Tensor]:
     """Create DSA cache views without applying normal MLA K/V splitting."""
     if page_stride is None:
@@ -779,6 +781,14 @@ def _view_dsv4_cache(
             cache_dtypes.append(kv_cache_spec.dtype)
             overlap_full_kv_cache = True
 
+    if compact_native_pages:
+        # A5 native DSA kernels address pages densely and cannot consume an
+        # arbitrary padded block stride. Keep the original allocation/budget,
+        # placing padding after the complete layer instead of between pages.
+        # All component views still alias the owned raw storage; no copy is made.
+        page_stride = sum(
+            math.prod(shape[1:]) * get_dtype_size(dtype) for shape, dtype in zip(cache_shapes[:2], cache_dtypes[:2])
+        )
     return _adjust_dsv4_kv_layout(
         raw_tensor,
         cache_shapes,
@@ -1332,6 +1342,9 @@ def _reshape_kv_cache_v2(
 
     vllm_config = get_current_vllm_config()
     is_dsv4_model = _is_dsv4_model(vllm_config)
+    compact_dsv4_pages = is_dsv4_model and bool(getattr(getattr(vllm_config, "quant_config", None), "is_gs32", False))
+    if compact_dsv4_pages and vllm_config.kv_transfer_config is not None:
+        raise ValueError("Compact GS32 native cache pages cannot use raw-page KV transfer.")
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     kv_caches: dict[str, Any] = {}
     layer_tuple_strides: dict[str, int] = {}
@@ -1494,7 +1507,9 @@ def _reshape_kv_cache_v2(
                 )
                 typed_cache = raw_cache.view(kv_cache_spec.dtype)
                 page_size_padded = kv_cache_spec.page_size_padded
-                if page_size_padded is not None:
+                if compact_dsv4_pages:
+                    kv_caches[layer_name] = typed_cache[: math.prod(kv_cache_shape)].view(kv_cache_shape)
+                elif page_size_padded is not None:
                     dtype_size = get_dtype_size(kv_cache_spec.dtype)
                     page_stride = page_size_padded // dtype_size
                     strides = [1] * len(kv_cache_shape)
@@ -1550,6 +1565,7 @@ def _reshape_kv_cache_v2(
                     group.backend,
                     kv_cache_config,
                     dsv4_page_strides.get(layer_name),
+                    compact_native_pages=compact_dsv4_pages,
                 )
                 continue
 

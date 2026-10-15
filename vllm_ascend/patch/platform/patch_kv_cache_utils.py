@@ -455,11 +455,58 @@ def _get_deepseek_v4_cache_layout(
     return page_sizes, bucketed, mtp_layer_names, mtp_page_size, num_layer_tuples
 
 
+def _gs32_native_cache_groups(vllm_config, groups):
+    """Use private dense regions: compacting differently sized aliases is unsafe.
+
+    The shared-tuple planner overlays cache groups by physical block ID. Native
+    A5 kernels require dense pages, so shrinking a padded page changes its block
+    addresses and can overlap another group's live blocks. Remove padding and
+    account for a private region for every layer before determining capacity.
+    """
+    if not getattr(getattr(vllm_config, "quant_config", None), "is_gs32", False):
+        return False
+    for group in groups:
+        specs = {
+            name: replace(spec, page_size_padded=None) if getattr(spec, "page_size_padded", None) is not None else spec
+            for name, spec in group.kv_cache_spec.kv_cache_specs.items()
+        }
+        native_spec = UniformTypeKVCacheSpecs.from_specs(specs)
+        if native_spec is None:
+            raise ValueError("GS32 private native caches require uniform layer types within each group")
+        object.__setattr__(group, "kv_cache_spec", native_spec)
+        object.__setattr__(group, "_gs32_private_native", True)
+    return True
+
+
+def _get_gs32_native_cache_config(vllm_config, groups, available_memory):
+    specs = {name: spec for group in groups for name, spec in group.kv_cache_spec.kv_cache_specs.items()}
+    bytes_per_block = sum(spec.page_size_bytes for spec in specs.values())
+    num_blocks = may_override_num_blocks(vllm_config, available_memory // bytes_per_block)
+    backing_size = num_blocks * bytes_per_block
+    if num_blocks < 1 or backing_size > available_memory:
+        raise ValueError("GS32 private native cache blocks exceed the supplied KV memory budget")
+    tensors, offset = [], 0
+    for name, spec in specs.items():
+        tensors.append(
+            KVCacheTensor(
+                size=backing_size,
+                layers=[name],
+                offset=offset,
+                layer_stride=0,
+                block_stride=spec.page_size_bytes,
+            )
+        )
+        offset += num_blocks * spec.page_size_bytes
+    return num_blocks, tensors
+
+
 def _get_kv_cache_config_deepseek_v4_main(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
 ) -> tuple[int, list[KVCacheTensor]]:
+    if _gs32_native_cache_groups(vllm_config, kv_cache_groups):
+        return _get_gs32_native_cache_config(vllm_config, kv_cache_groups, available_memory)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.cache_config(vllm_config, kv_cache_groups, available_memory)
     (
@@ -547,6 +594,10 @@ def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int
     layout, so using the upstream value changes ``num_blocks`` during the
     re-plan and leaves ranks inconsistent.
     """
+    if any(getattr(group, "_gs32_private_native", False) for group in kv_cache_groups):
+        return sum(
+            spec.page_size_bytes for group in kv_cache_groups for spec in group.kv_cache_spec.kv_cache_specs.values()
+        )
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.pool_bytes_per_block(kv_cache_groups)
     if is_deepseek_v41_cache(kv_cache_groups):
@@ -565,6 +616,13 @@ def _ascend_max_memory_usage_bytes_from_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """Keep the pre-#51718 DSV4 admission formula for its shared tuples."""
+    if _is_deepseek_v4_groups(kv_cache_groups) and _gs32_native_cache_groups(vllm_config, kv_cache_groups):
+        # Groups draw distinct IDs from one global block pool. Every private
+        # layer region must cover the complete pool, including other groups'
+        # IDs, so admission uses the pool divisor times the sum of group needs.
+        return _ascend_pool_bytes_per_block(kv_cache_groups) * sum(
+            group.kv_cache_spec.max_memory_usage_pages(vllm_config) for group in kv_cache_groups
+        )
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:

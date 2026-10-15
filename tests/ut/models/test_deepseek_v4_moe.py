@@ -293,6 +293,7 @@ def test_hash_layer_router_bias_is_skipped_when_unused(monkeypatch):
 
     model = deepseek_v4_module.AscendDeepseekV4ForCausalLM.__new__(deepseek_v4_module.AscendDeepseekV4ForCausalLM)
     nn.Module.__init__(model)
+    model.quant_config = None
     model.model = inner
     model.config = SimpleNamespace(
         n_routed_experts=num_experts,

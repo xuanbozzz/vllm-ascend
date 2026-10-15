@@ -53,6 +53,7 @@ CHECK_IMPORTS = {
             # Cache key preparation and native build wrappers must work before
             # third-party Python build dependencies are installed.
             "csrc/scripts/build_cache.py",
+            "tools/build_vq2a8_gs32_stage.py",
             # The doctest selector runs in a minimal CPU workflow before
             # project dependencies are installed.
             "tests/e2e/doctests/scripts/doctest_helper.py",

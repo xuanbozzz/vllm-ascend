@@ -172,6 +172,16 @@ def test_load_adopts_draft_layers_and_shares_runner_owned_manager():
     assert runner.speculator.expert_offload_manager is manager
 
 
+@pytest.mark.parametrize("tokens,dummy,expected", [(0, False, 0), (1, False, 1), (0, True, 1)])
+def test_validity_lifecycle_skips_scheduler_steps_without_a_model_forward(tokens, dummy, expected):
+    runner, _ = make_runner()
+    runner.vq2a8_runtime = Mock()
+    scheduler = SimpleNamespace(total_num_scheduled_tokens=tokens, num_scheduled_tokens={"request": tokens})
+    assert runner.execute_model(scheduler, dummy_run=dummy) == "result"
+    assert runner.vq2a8_runtime.begin.call_count == expected
+    assert runner.vq2a8_runtime.check.call_count == expected
+
+
 @pytest.mark.parametrize("profile,failed", [(False, False), (True, False), (False, True)])
 def test_dspark_propose_owns_draft_lifecycle_and_preserves_parent_arguments(profile, failed):
     manager = ExpertOffloadManager()

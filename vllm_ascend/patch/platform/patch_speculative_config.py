@@ -192,9 +192,37 @@ def _temporarily_disable_dspark_dcp(self: SpeculativeConfig):
         self.target_parallel_config = target_parallel_config
 
 
+@contextmanager
+def _separate_original_dspark_checkpoint(self: SpeculativeConfig):
+    target = getattr(self, "target_model_config", None)
+    requested_model = getattr(self, "model", None)
+    separate = (
+        getattr(self, "method", None) == "dspark"
+        and getattr(target, "quantization", None) == "vq2a8"
+        and requested_model is not None
+        and requested_model != target.model
+    )
+    if not separate:
+        yield
+        return
+    quantization = getattr(self, "quantization", None)
+    if quantization in (None, "vq2a8"):
+        raise ValueError("An independent DSpark checkpoint requires its original quantization method.")
+    # Upstream DeepSeek DSpark unconditionally copies target.model/quantization
+    # into the draft. Supply a private guard while it constructs the draft,
+    # retaining all target dimensions, tokenizer, parallelism and length checks.
+    guard = copy(target)
+    guard.model, guard.quantization = requested_model, quantization
+    self.target_model_config = guard
+    try:
+        yield
+    finally:
+        self.target_model_config = target
+
+
 def _dspark_post_init(self):
     # TODO: This block can be deleted after the upstream supports the overlay of mla dcp and dspark
-    with _temporarily_disable_dspark_dcp(self):
+    with _separate_original_dspark_checkpoint(self), _temporarily_disable_dspark_dcp(self):
         _orig_post_init(self)
     if self.use_dspark():
         draft_model_config = getattr(self, "draft_model_config", None)

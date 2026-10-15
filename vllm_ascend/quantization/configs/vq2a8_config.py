@@ -24,6 +24,7 @@ from vllm_ascend.ops.vq2a8 import VQ2A8_MAX_EXPERTS, VQ2A8ProjectionSpec, projec
 from vllm_ascend.quantization.utils import is_fused_moe_layer
 
 from ..methods import get_scheme_class
+from ..methods.w2a8.vq2a8_gs32_format import GS32_FORMAT, GS32ProjectionSpec, gs32_projection_shapes
 
 MAX_DECODE_GRAPH_CONTEXT = 128
 
@@ -32,7 +33,7 @@ MAX_DECODE_GRAPH_CONTEXT = 128
 class VQ2A8LayerSpec:
     layer_index: int
     expert_ids: tuple[int, ...]
-    specs: Mapping[str, VQ2A8ProjectionSpec]
+    specs: Mapping[str, VQ2A8ProjectionSpec | GS32ProjectionSpec]
 
 
 def _parse_layers(config) -> dict[int, VQ2A8LayerSpec]:
@@ -40,11 +41,12 @@ def _parse_layers(config) -> dict[int, VQ2A8LayerSpec]:
         not isinstance(config, dict)
         or set(config) != {"quant_method", "format", "format_version", "layers"}
         or config["quant_method"] != "vq2a8"
-        or config["format"] != "ascend_vq2a8"
+        or config["format"] not in ("ascend_vq2a8", GS32_FORMAT)
         or type(config["format_version"]) is not int
         or config["format_version"] != 1
     ):
-        raise ValueError("VQ2A8 requires the unified ascend_vq2a8 version 1 quantization_config.")
+        raise ValueError("VQ2A8 requires unified ascend_vq2a8 or ascend_vq2a8_gs32 version 1 metadata.")
+    gs32 = config["format"] == GS32_FORMAT
     entries = config["layers"]
     if not isinstance(entries, dict) or not entries:
         raise ValueError("VQ2A8 layers must be a nonempty object.")
@@ -65,16 +67,15 @@ def _parse_layers(config) -> dict[int, VQ2A8LayerSpec]:
         specs = {}
         for kind in ("gate_up", "down"):
             fields = entry[kind]
-            names = {"rows", "columns", "rht_true_columns", "rht_block_size"}
+            names = {"rows", "columns"} if gs32 else {"rows", "columns", "rht_true_columns", "rht_block_size"}
             if not isinstance(fields, dict) or set(fields) != names:
                 raise ValueError(f"Invalid VQ2A8 {key}.{kind} projection fields.")
-            spec = VQ2A8ProjectionSpec(**fields)
-            projection_shapes(spec)
+            spec = GS32ProjectionSpec(**fields) if gs32 else VQ2A8ProjectionSpec(**fields)
+            (gs32_projection_shapes if gs32 else projection_shapes)(spec)
             specs[kind] = spec
-        if (
-            specs["gate_up"].rows != 2 * specs["down"].rht_true_columns
-            or specs["down"].rows != specs["gate_up"].rht_true_columns
-        ):
+        gate_columns = specs["gate_up"].columns if gs32 else specs["gate_up"].rht_true_columns
+        down_columns = specs["down"].columns if gs32 else specs["down"].rht_true_columns
+        if specs["gate_up"].rows != 2 * down_columns or specs["down"].rows != gate_columns:
             raise ValueError("VQ2A8 projection geometries do not form an expert MLP.")
         index = int(key)
         layers[index] = VQ2A8LayerSpec(index, tuple(ids), specs)
@@ -86,6 +87,21 @@ def _parse_layers(config) -> dict[int, VQ2A8LayerSpec]:
 def validate_vq2a8_config(config) -> dict:
     """Reject unsupported execution before allocating compressed parameters."""
     options = (config.additional_config or {}).get("vq2a8", {})
+    metadata = getattr(getattr(config.model_config, "hf_config", None), "quantization_config", {}) or {}
+    gs32 = metadata.get("format") == "ascend_vq2a8_gs32"
+    native_options = options
+    if gs32:
+        if not isinstance(options, dict) or set(options) - {"gs32_library", "gs32_binary", "gs32_execution"}:
+            raise ValueError("Unknown GS32 native options.")
+        for key in ("gs32_library", "gs32_binary"):
+            if not isinstance(options.get(key), str) or not Path(options[key]).is_absolute():
+                raise ValueError("GS32 requires absolute gs32_library and gs32_binary paths.")
+        execution = options.get("gs32_execution", "serial")
+        expected = ("serial", "batched", "fused") if config.model_config.enforce_eager else ("full_graph",)
+        if execution not in expected:
+            raise ValueError("GS32 execution mode does not match eager/decode graph configuration.")
+        options = {"decode_mode": "device"}
+
     allowed = {
         "ascendc_library",
         "ascendc_sha256",
@@ -204,7 +220,11 @@ def validate_vq2a8_config(config) -> dict:
         or getattr(config.model_config, "enable_sleep_mode", False)
     ):
         raise ValueError("VQ2A8 native banks require stable resident parameters; offload/sleep is unsupported.")
-    result = dict(options)
+    result = dict(native_options if gs32 else options)
+    if gs32:
+        top_k = config.model_config.hf_config.num_experts_per_tok
+        if not use_v2 or not 1 <= top_k <= 8 or verify_tokens > 128 or verify_tokens * top_k > 256:
+            raise ValueError("GS32 requires MRV2 with at most 128 verification tokens and 256 routed rows.")
     result["_max_device_tokens"] = verify_tokens
     return result
 
@@ -214,6 +234,8 @@ class AscendVQ2A8Config(QuantizationConfig):
     def __init__(self, config=None):
         super().__init__()
         self.layers = _parse_layers(config)
+        self.format = config["format"]
+        self.is_gs32 = self.format == GS32_FORMAT
         self._prefill_graph_cache = None
 
     @classmethod
@@ -265,7 +287,7 @@ class AscendVQ2A8Config(QuantizationConfig):
                 raise ValueError("VQ2A8 non-hash layers must store every logical expert.")
             for kind, shape in expected_shapes.items():
                 spec = layer.specs[kind]
-                if (spec.rows, spec.rht_true_columns) != shape:
+                if (spec.rows, spec.columns if self.format == GS32_FORMAT else spec.rht_true_columns) != shape:
                     raise ValueError(f"VQ2A8 layer {index}.{kind} geometry disagrees with model config.")
 
     def get_quant_method(self, layer, prefix, tid2eid=None):
@@ -285,7 +307,7 @@ class AscendVQ2A8Config(QuantizationConfig):
         self.validate_model_config(config.model_config.hf_config)
         from vllm_ascend.quantization.method_adapters import AscendFusedMoEMethod
 
-        scheme_cls = get_scheme_class("VQ2A8", "moe")
+        scheme_cls = get_scheme_class("VQ2A8_GS32" if self.format == GS32_FORMAT else "VQ2A8", "moe")
         if scheme_cls is None:
             raise NotImplementedError("No registered VQ2A8 scheme for layer_type=moe.")
 

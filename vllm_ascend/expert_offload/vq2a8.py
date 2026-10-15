@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Offload final contiguous VQ payloads; keep native bank addresses stable."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
 
+from .host_store import allocate_native_expert_bytes
 from .types import ExpertTensorSpec, ExpertWeightView, PreparedExpertTensor
 
 
@@ -32,7 +34,10 @@ class VQ2A8HostStore:
             tensor = parameter.detach()
             if tensor.device.type != "cpu" or tuple(tensor.shape) != spec.shape or tensor.dtype != spec.dtype:
                 raise ValueError(f"Unexpected VQ host layout: {spec.name}")
-            self.tensors[spec.name] = tensor.pin_memory() if pin_memory else tensor.clone()
+            # Pin only the final bounded native byte blocks, retaining pageable
+            # raw tensors until the layer's native store has been prepared.
+            self.tensors[spec.name] = tensor.clone()
+        self.pin_memory = pin_memory
         self.finalized = True
 
     def prepare_native(self, adapter, destination, device):
@@ -50,8 +55,14 @@ class VQ2A8HostStore:
                 or int(torch_npu.get_storage_size(target)) * target.element_size() != size * target.shape[0]
             ):
                 raise ValueError("VQ offload requires unpadded contiguous expert blocks")
+            raw_bytes = tensor.view(torch.uint8).reshape(self.num_experts, size)
+            data = raw_bytes
+            if self.pin_memory:
+                data = allocate_native_expert_bytes(self.num_experts, size)
+                for expert_id in range(self.num_experts):
+                    data[expert_id].copy_(raw_bytes[expert_id])
             self.prepared[name] = PreparedExpertTensor(
-                data=tensor.view(torch.uint8).reshape(self.num_experts, size),
+                data=data,
                 shape=tuple(target.shape[1:]),
                 stride=tuple(target.stride()),
                 dtype=target.dtype,
@@ -115,5 +126,29 @@ class VQ2A8ExpertAdapter:
                 native_options=self.scheme.native_options,
                 prefill_graph_cache=self.scheme.prefill_graph_cache,
             )
+        view.vq2a8_weights = self.banks[key]
+        return view
+
+
+class GS32ExpertAdapter(VQ2A8ExpertAdapter):
+    fields = ("packed_zn", "pair_lut", "row_scale_bits", "perm", "weight_scale")
+    tensor_names = tuple(f"{prefix}_{field}" for field in fields for prefix in ("w13", "w2"))
+
+    def signature(self, host_store):
+        return ("vq2a8_gs32", host_store.specs, tuple(self.scheme.layer_spec.specs.items()))
+
+    def make_view(self, layer, tensors, *, full_pool):
+        view = ExpertWeightView(layer, tensors)
+        if torch.device(layer.moe_config.device).type != "npu":
+            return view
+        key = "full" if full_pool else "resident"
+        if key not in self.banks:
+            from vllm_ascend.ops.fused_moe.vq2a8_gs32 import GS32ExpertWeights
+
+            count = tensors["w13_packed_zn"].shape[0]
+            ids = self.available_experts if full_pool else tuple(range(count))
+            prototype = SimpleNamespace(**tensors, vq2a8_num_experts=layer.local_num_experts if full_pool else count)
+            spec = replace(self.scheme.layer_spec, expert_ids=ids)
+            self.banks[key] = GS32ExpertWeights(prototype, spec, self.scheme.native_options)
         view.vq2a8_weights = self.banks[key]
         return view

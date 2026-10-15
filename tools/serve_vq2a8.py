@@ -18,8 +18,8 @@ DEEPSEEK_V4_REQUIRED_OPS = (
     "inplace_partial_rotary_mul",
     "compressor",
     "compressor_metadata",
-    "npu_vllm_quant_lightning_indexer",
-    "npu_vllm_quant_lightning_indexer_metadata",
+    "npu_quant_lightning_indexer_v2",
+    "npu_quant_lightning_indexer_v2_metadata",
     "npu_kv_quant_sparse_attn_sharedkv",
     "npu_kv_quant_sparse_attn_sharedkv_metadata",
     "kv_compress_epilog",
@@ -35,6 +35,9 @@ def parse_args(argv=None):
         type=Path,
         help="unsupported for full-model serving; use the main extension's built-in VQ operators",
     )
+    parser.add_argument("--gs32-library", type=Path)
+    parser.add_argument("--gs32-binary", type=Path)
+    parser.add_argument("--gs32-execution", choices=("serial", "batched", "fused", "full_graph"))
     parser.add_argument("--max-model-len", type=int)
     parser.add_argument("--draft-model", type=Path, help="original-format DSpark checkpoint")
     parser.add_argument("--num-speculative-tokens", type=int, default=0)
@@ -111,11 +114,19 @@ def build_command(args):
         raise ValueError("Invalid speculative token count or resident expert count.")
     if bool(args.num_speculative_tokens) != bool(args.draft_model):
         raise ValueError("Supply both --draft-model and a positive --num-speculative-tokens.")
+    draft_quantization = None
     if args.draft_model is not None:
         draft = args.draft_model.resolve(strict=True)
         draft_config = json.loads((draft / "config.json").read_text())
-        if draft_config.get("quantization_config", {}).get("quant_method") == "vq2a8":
+        draft_quantization = (draft_config.get("quantization_config") or {}).get("quant_method")
+        if draft_quantization == "vq2a8":
             raise ValueError("DSpark draft must retain its original format, not VQ2A8.")
+        if draft_quantization == "fp8" and draft_config.get("model_type") == "deepseek_v4":
+            # The generic FP8 backend does not implement this checkpoint's MXFP4 experts.
+            draft_quantization = "deepseek_v4_fp8"
+        elif draft_quantization == "modelslim":
+            draft_quantization = "ascend"
+
     if not math.isfinite(args.memory_fraction) or not 0 < args.memory_fraction <= 1:
         raise ValueError("memory_fraction must be finite and in (0,1].")
     if not math.isfinite(args.reserve_gib) or args.reserve_gib < 1:
@@ -137,7 +148,7 @@ def build_command(args):
     if (
         not isinstance(quantization, dict)
         or quantization.get("quant_method") != "vq2a8"
-        or quantization.get("format") != "ascend_vq2a8"
+        or quantization.get("format") not in ("ascend_vq2a8", "ascend_vq2a8_gs32")
         or quantization.get("format_version") != 1
         or not (model / "model.safetensors.index.json").is_file()
     ):
@@ -163,6 +174,27 @@ def build_command(args):
         additional["vq2a8"]["prefill_rht"] = args.prefill_rht
     if args.prefill_batch_mode != "jobs":
         additional["vq2a8"]["prefill_batch_mode"] = args.prefill_batch_mode
+    if quantization.get("format") == "ascend_vq2a8_gs32":
+        if args.activation_preparation != "packed" or args.prefill_rht != "rowwise" or args.validity_mode != "torch":
+            raise ValueError("RHT-specific activation/validity options cannot be used with GS32.")
+        if args.gs32_library is None or args.gs32_binary is None:
+            raise ValueError("GS32 requires --gs32-library and --gs32-binary.")
+        native = {
+            "gs32_library": args.gs32_library.resolve(strict=True),
+            "gs32_binary": args.gs32_binary.resolve(strict=True),
+        }
+        if any(not path.is_file() for path in native.values()):
+            raise ValueError("GS32 native artifacts must be regular files.")
+        execution = args.gs32_execution or ("full_graph" if args.execution_mode == "decode_graph" else "serial")
+        if (execution == "full_graph") != (args.execution_mode == "decode_graph"):
+            raise ValueError("GS32 execution must match eager/decode_graph mode.")
+        additional["vq2a8"] = {key: str(value) for key, value in native.items()}
+        additional["vq2a8"]["gs32_execution"] = execution
+        verify_tokens = args.num_speculative_tokens + 1
+        if verify_tokens > 128 or verify_tokens * config["num_experts_per_tok"] > 256:
+            raise ValueError("GS32 verification block exceeds native routed-row capacity.")
+    elif args.gs32_library or args.gs32_binary or args.gs32_execution:
+        raise ValueError("GS32 native options require a GS32 checkpoint.")
     if args.expert_offload:
         additional["expert_offload_config"] = {"enabled": True, "num_device_experts": args.num_device_experts}
     command = [
@@ -202,7 +234,10 @@ def build_command(args):
         "--block-size",
         "32",
         "--kv-cache-dtype",
-        args.kv_cache_dtype,
+        # A5's GS32 attention plan uses compressed FP8 KV; upstream auto resolves to BF16.
+        "fp8"
+        if quantization.get("format") == "ascend_vq2a8_gs32" and args.kv_cache_dtype == "auto"
+        else args.kv_cache_dtype,
         "--kv-cache-memory-bytes",
         str(args.kv_cache_mib * 1024**2),
         "--gpu-memory-utilization",
@@ -224,6 +259,8 @@ def build_command(args):
                     {
                         "method": "dspark",
                         "model": str(args.draft_model.resolve()),
+                        # Upstream otherwise inherits target quantization, even for another checkpoint.
+                        "quantization": draft_quantization,
                         "num_speculative_tokens": args.num_speculative_tokens,
                         "enforce_eager": True,
                     }
@@ -238,6 +275,7 @@ def build_command(args):
                 "cudagraph_mode": "FULL_DECODE_ONLY",
                 "cudagraph_capture_sizes": [args.num_speculative_tokens + 1],
                 "max_cudagraph_capture_size": args.num_speculative_tokens + 1,
+                "cudagraph_num_of_warmups": 1,
             }
         )
         additional["ascend_compilation_config"] = {"enable_npugraph_ex": False}

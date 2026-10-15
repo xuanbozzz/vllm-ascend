@@ -13,7 +13,7 @@ from .quantization import MXFP4ExpertAdapter
 from .residency import ExpertResidency
 from .transfer import TorchExpertTransfer
 from .types import ExpertWeightView
-from .vq2a8 import VQ2A8ExpertAdapter, VQ2A8HostStore
+from .vq2a8 import GS32ExpertAdapter, VQ2A8ExpertAdapter, VQ2A8HostStore
 
 
 class OffloadState(Enum):
@@ -36,7 +36,12 @@ class LayerOffloadBinding:
         self.top_k = layer.top_k
         self.device = torch.device(layer.moe_config.device)
         if hasattr(scheme, "layer_spec"):
-            self.adapter = VQ2A8ExpertAdapter(layer, scheme)
+            adapter_cls = (
+                GS32ExpertAdapter
+                if getattr(scheme, "checkpoint_format", None) == "ascend_vq2a8_gs32"
+                else VQ2A8ExpertAdapter
+            )
+            self.adapter = adapter_cls(layer, scheme)
             self.num_slots = min(self.num_slots, len(self.adapter.available_experts))
             self.host_store = VQ2A8HostStore(layer, self.adapter)
         else:
@@ -51,7 +56,17 @@ class LayerOffloadBinding:
         if self.resident:
             raise RuntimeError("expert offload does not support weight reload or repeated post-processing")
         try:
-            self.host_store.finalize(layer, pin_memory=self.device.type == "npu")
+            if self.device.type == "npu" and isinstance(self.host_store, (HostExpertStore, VQ2A8HostStore)):
+                # Reserve before locking the checkpoint banks. This bounded
+                # buffer keeps native transfers usable if the host pin budget
+                # is exhausted while preparing a later target/draft layer.
+                self.host_store.transfer_staging = TorchExpertTransfer.reserve_host_staging()
+            # VQ bytes are already native and remain the transfer source. W4
+            # checkpoint tensors are converted once into a separate pinned
+            # native store; pinning those temporary raw copies doubles the
+            # locked host memory peak (and leaves it in the caching allocator).
+            pin_raw = self.device.type == "npu" and isinstance(self.host_store, VQ2A8HostStore)
+            self.host_store.finalize(layer, pin_memory=pin_raw)
             initial_ids = getattr(self.adapter, "available_experts", tuple(range(self.num_slots)))[: self.num_slots]
             self.resident = self.adapter.materialize(self.host_store, initial_ids, self.device)
             if self.device.type == "npu":

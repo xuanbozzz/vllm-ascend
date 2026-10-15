@@ -1,0 +1,2 @@
+# Imported native source bytes are verified by SOURCE_MANIFEST.json.
+csrc/mixed_w2w4_moe_ffn/** -text

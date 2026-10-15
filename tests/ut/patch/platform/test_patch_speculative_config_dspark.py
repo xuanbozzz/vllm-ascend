@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,6 +12,41 @@ from vllm_ascend.patch.platform.patch_speculative_config import (
     _ascend_verify_with_parallel_config,
     _normalize_deepseek_dspark_draft,
 )
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_independent_original_dspark_checkpoint_does_not_mutate_vq_target(fail):
+    target = SimpleNamespace(model="/target-gs32", quantization="vq2a8", tokenizer="/target-gs32")
+    config = SimpleNamespace(
+        method="dspark",
+        model="/original",
+        quantization="fp8",
+        target_model_config=target,
+    )
+    expectation = pytest.raises(RuntimeError, match="upstream") if fail else nullcontext()
+    with expectation, patch_speculative_config._separate_original_dspark_checkpoint(config):
+        guard = config.target_model_config
+        assert guard is not target
+        assert (guard.model, guard.quantization) == ("/original", "fp8")
+        assert guard.tokenizer == target.tokenizer
+        assert (target.model, target.quantization) == ("/target-gs32", "vq2a8")
+        if fail:
+            raise RuntimeError("upstream")
+    assert config.target_model_config is target
+
+
+def test_independent_dspark_requires_explicit_original_quantization():
+    config = SimpleNamespace(
+        method="dspark",
+        model="/original",
+        quantization=None,
+        target_model_config=SimpleNamespace(model="/gs32", quantization="vq2a8"),
+    )
+    with (
+        pytest.raises(ValueError, match="original quantization"),
+        patch_speculative_config._separate_original_dspark_checkpoint(config),
+    ):
+        pytest.fail("Unknown draft format reached upstream construction")
 
 
 def test_legacy_qwen3_dspark_config_uses_qwen3_loader():

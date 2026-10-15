@@ -622,7 +622,7 @@ class NPUModelRunner(GPUModelRunner):
         runtime = getattr(self, "vq2a8_runtime", None)
         with dp_coordination_context:
             try:
-                if runtime is not None:
+                if runtime is not None and dump_forward:
                     runtime.begin()
                 output = super().execute_model(
                     scheduler_output,
@@ -633,7 +633,7 @@ class NPUModelRunner(GPUModelRunner):
                     context_len=context_len,
                     valid_dummy_state_slots=valid_dummy_state_slots,
                 )
-                if runtime is not None:
+                if runtime is not None and dump_forward:
                     runtime.check()
                 forward_failed = False
             finally:

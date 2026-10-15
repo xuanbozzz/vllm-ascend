@@ -7,8 +7,8 @@ import torch
 import torch_npu
 
 from vllm_ascend.expert_offload.host_store import HostExpertStore
+from vllm_ascend.expert_offload.prefill import PrefillExpertPool
 from vllm_ascend.expert_offload.quantization import MXFP4ExpertAdapter
-from vllm_ascend.expert_offload.transfer import TorchExpertTransfer
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
     AscendW4A8MXFPDSDynamicFusedMoEMethod,
     maybe_normalize_mxfp_scale_layout,
@@ -86,7 +86,7 @@ def _gemm(x, weight, scale, counts):
     )[0]
 
 
-def test_nz_full_layer_copy_preserves_addresses_and_complete_bundle(expert_bundle, monkeypatch):
+def test_nz_prefill_pool_refill_preserves_addresses_and_complete_bundle(expert_bundle, monkeypatch):
     adapter, store = expert_bundle
     indices = torch.arange(NUM_EXPERTS - 1, -1, -1)
     store.tensors = {name: tensor.index_select(0, indices) for name, tensor in store.tensors.items()}
@@ -95,17 +95,15 @@ def test_nz_full_layer_copy_preserves_addresses_and_complete_bundle(expert_bundl
     prototype = adapter.materialize(store, [0], binding.device)
     store.prepare_native(adapter, prototype, binding.device)
     del prototype
-    destination = adapter.allocate_pool(store, NUM_EXPERTS, binding.device)
-    pointers = {name: tensor.data_ptr() for name, tensor in destination.items()}
+    pool = PrefillExpertPool()
+    pool.initialize(binding)
+    pointers = {name: tensor.data_ptr() for name, tensor in pool.tensors.items()}
 
     def forbidden_conversion(*args):
         raise AssertionError("runtime prefill must not format-cast")
 
     monkeypatch.setattr(adapter.scheme, "process_weights_after_loading", forbidden_conversion)
-    TorchExpertTransfer.copy_experts(
-        adapter, store, destination, tuple((eid, eid) for eid in range(NUM_EXPERTS)), binding.device
-    )
-    actual = destination
+    actual = pool.fill(binding)
     for name in actual:
         assert actual[name].data_ptr() == pointers[name]
         assert torch.equal(_physical_bytes(actual[name]), _physical_bytes(expected[name]))
@@ -119,4 +117,4 @@ def test_nz_full_layer_copy_preserves_addresses_and_complete_bundle(expert_bundl
     gate, up = _gemm(x, expected["w13_weight"], expected["w13_weight_scale"], counts).chunk(2, -1)
     reference = _gemm(torch.nn.functional.silu(gate) * up, expected["w2_weight"], expected["w2_weight_scale"], counts)
     torch.testing.assert_close(output, reference, rtol=0, atol=0)
-    store.close()
+    pool.close()

@@ -15,5 +15,5 @@ exec vllm serve "$model_path" \
     --max-num-batched-tokens 512 --max-num-seqs 4 --enable-chunked-prefill \
     --kv-cache-memory-bytes 2147483648 --seed 0 \
     --enforce-eager \
-    --additional-config '{"expert_offload_config":{"enabled":true}}' \
+    --additional-config '{"expert_offload_config":{"enabled":true,"num_device_experts":16}}' \
     "$@"

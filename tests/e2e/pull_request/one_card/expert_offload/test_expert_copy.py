@@ -9,6 +9,7 @@ import torch_npu
 from vllm_ascend.expert_offload.host_store import HostExpertStore
 from vllm_ascend.expert_offload.prefill import PrefillExpertPool
 from vllm_ascend.expert_offload.quantization import MXFP4ExpertAdapter
+from vllm_ascend.expert_offload.transfer import TorchExpertTransfer
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
     AscendW4A8MXFPDSDynamicFusedMoEMethod,
     maybe_normalize_mxfp_scale_layout,
@@ -86,15 +87,46 @@ def _gemm(x, weight, scale, counts):
     )[0]
 
 
+def test_nz_slot_replacement_preserves_storage_and_both_gemms(expert_bundle, monkeypatch):
+    adapter, store = expert_bundle
+    device = torch.device("npu:0")
+    resident = adapter.materialize(store, [0, 1, 2], device)
+    pointers = {name: tensor.data_ptr() for name, tensor in resident.items()}
+    expected = adapter.materialize(store, [3, 4, 5], device)
+    full = adapter.materialize(store, range(NUM_EXPERTS), device)
+    store.prepare_native(adapter, resident, device)
+
+    def forbidden_conversion(*args):
+        raise AssertionError("runtime expert replacement must not format-cast")
+
+    monkeypatch.setattr(adapter.scheme, "process_weights_after_loading", forbidden_conversion)
+    allocated = torch.npu.memory_allocated(device)
+    torch.npu.reset_peak_memory_stats(device)
+    TorchExpertTransfer.copy_experts(adapter, store, resident, [(3, 0), (4, 1), (5, 2)], device)
+    assert torch.npu.memory_allocated(device) == allocated
+    assert torch.npu.max_memory_allocated(device) == allocated
+    for name in resident:
+        assert resident[name].data_ptr() == pointers[name]
+        assert torch.equal(_physical_bytes(resident[name]), _physical_bytes(expected[name]))
+    x = torch.randn(6, HIDDEN_SIZE, generator=torch.Generator().manual_seed(1)).to(device, dtype=torch.bfloat16)
+    actual = _gemm(x, resident["w13_weight"], resident["w13_weight_scale"], [2, 4, 6])
+    reference = _gemm(x, full["w13_weight"], full["w13_weight_scale"], [0, 0, 0, 2, 4, 6])
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    gate, up = actual.chunk(2, dim=-1)
+    hidden = torch.nn.functional.silu(gate) * up
+    actual = _gemm(hidden, resident["w2_weight"], resident["w2_weight_scale"], [2, 4, 6])
+    reference = _gemm(hidden, full["w2_weight"], full["w2_weight_scale"], [0, 0, 0, 2, 4, 6])
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
 def test_nz_prefill_pool_refill_preserves_addresses_and_complete_bundle(expert_bundle, monkeypatch):
     adapter, store = expert_bundle
     indices = torch.arange(NUM_EXPERTS - 1, -1, -1)
     store.tensors = {name: tensor.index_select(0, indices) for name, tensor in store.tensors.items()}
     binding = SimpleNamespace(adapter=adapter, host_store=store, num_experts=NUM_EXPERTS, device=torch.device("npu:0"))
     expected = adapter.materialize(store, range(NUM_EXPERTS), binding.device)
-    prototype = adapter.materialize(store, [0], binding.device)
-    store.prepare_native(adapter, prototype, binding.device)
-    del prototype
+    resident = adapter.materialize(store, [0, 1], binding.device)
+    store.prepare_native(adapter, resident, binding.device)
     pool = PrefillExpertPool()
     pool.initialize(binding)
     pointers = {name: tensor.data_ptr() for name, tensor in pool.tensors.items()}
@@ -107,14 +139,4 @@ def test_nz_prefill_pool_refill_preserves_addresses_and_complete_bundle(expert_b
     for name in actual:
         assert actual[name].data_ptr() == pointers[name]
         assert torch.equal(_physical_bytes(actual[name]), _physical_bytes(expected[name]))
-    counts = list(range(1, NUM_EXPERTS + 1))
-    x = torch.randn(NUM_EXPERTS, HIDDEN_SIZE, generator=torch.Generator().manual_seed(9)).to(
-        binding.device, dtype=torch.bfloat16
-    )
-    gate, up = _gemm(x, actual["w13_weight"], actual["w13_weight_scale"], counts).chunk(2, -1)
-    hidden = torch.nn.functional.silu(gate) * up
-    output = _gemm(hidden, actual["w2_weight"], actual["w2_weight_scale"], counts)
-    gate, up = _gemm(x, expected["w13_weight"], expected["w13_weight_scale"], counts).chunk(2, -1)
-    reference = _gemm(torch.nn.functional.silu(gate) * up, expected["w2_weight"], expected["w2_weight_scale"], counts)
-    torch.testing.assert_close(output, reference, rtol=0, atol=0)
     pool.close()

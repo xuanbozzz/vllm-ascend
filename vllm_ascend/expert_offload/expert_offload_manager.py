@@ -10,6 +10,8 @@ import torch
 from .host_store import HostExpertStore
 from .prefill import PrefillExpertPool
 from .quantization import MXFP4ExpertAdapter
+from .residency import ExpertResidency
+from .transfer import TorchExpertTransfer
 from .types import ExpertWeightView
 
 
@@ -29,29 +31,28 @@ class LayerOffloadBinding:
             raise ValueError("expert offload PR01 does not support sequence-parallel or biased experts")
         self.layer_name = layer.layer_name
         self.num_experts = layer.local_num_experts
+        self.num_slots = config.num_device_experts
         self.top_k = layer.top_k
         self.device = torch.device(layer.moe_config.device)
         self.adapter = MXFP4ExpertAdapter(layer, scheme)
         self.host_store = HostExpertStore(layer, self.adapter.tensor_names)
+        self.residency = ExpertResidency(self.num_experts, self.num_slots)
         self.manager: ExpertOffloadManager | None = None
-        self.loaded = False
+        self.resident: dict[str, torch.Tensor] = {}
 
     def process_weights_after_loading(self, layer) -> None:
-        if self.host_store.finalized:
+        if self.resident:
             raise RuntimeError("expert offload does not support weight reload or repeated post-processing")
         try:
             self.host_store.finalize(layer, pin_memory=self.device.type == "npu")
+            self.resident = self.adapter.materialize(self.host_store, range(self.num_slots), self.device)
             if self.device.type == "npu":
-                # A single temporary expert supplies the physical layout. No per-layer slots persist.
-                prototype = self.adapter.materialize(self.host_store, (0,), self.device)
                 torch.npu.current_stream(self.device).synchronize()
-                self.host_store.prepare_native(self.adapter, prototype, self.device)
-                del prototype
-            # Execution always receives an explicit full-pool view; retire raw Parameters.
-            for name in self.adapter.tensor_names:
-                parameter = getattr(layer, name)
-                parameter.data = torch.empty(0, dtype=parameter.dtype, device="cpu")
-            self.loaded = True
+                self.host_store.prepare_native(self.adapter, self.resident, self.device)
+            # Preserve Parameter metadata/loaders, and allocate no full device layer here.
+            for name, tensor in self.resident.items():
+                getattr(layer, name).data = tensor
+            self.residency.commit(self.residency.plan(range(self.num_slots)))
         except Exception:
             self.close()
             raise
@@ -61,19 +62,30 @@ class LayerOffloadBinding:
         if manager is None or manager.state is not OffloadState.READY or not manager.executing:
             raise RuntimeError("expert offload layer requires a ready runner-owned execution")
         try:
-            tensors = manager.prefill_pool.fill(self)
-            return (
-                ExpertWeightView(layer, tensors),
-                selected_ids,
-                manager.get_comm(self, layer.moe_config, self.num_experts),
-            )
+            # One batched synchronization. No scalar device .item() loop.
+            logical_ids = selected_ids.detach().to(device="cpu", dtype=torch.long).reshape(-1).tolist()
+            plan = self.residency.plan(logical_ids)
+            full_pool = manager.has_prefill or manager.is_profile or plan.use_full_pool
+            if full_pool:
+                tensors = manager.prefill_pool.fill(self)
+                physical_ids = selected_ids
+                count = self.num_experts
+            else:
+                TorchExpertTransfer.copy_experts(self.adapter, self.host_store, self.resident, plan.loads, self.device)
+                self.residency.commit(plan)
+                mapping = torch.tensor(self.residency.logical_to_physical(), device=selected_ids.device)
+                physical_ids = mapping[selected_ids.long()].to(selected_ids.dtype)
+                tensors = self.resident
+                count = self.num_slots
+            # A private comm instance avoids mutating the cached full-layer dispatcher.
+            return ExpertWeightView(layer, tensors), physical_ids, manager.get_comm(self, layer.moe_config, count)
         except Exception:
             manager.state = OffloadState.FAILED
             raise
 
     def close(self) -> None:
         self.host_store.close()
-        self.loaded = False
+        self.resident.clear()
         self.manager = None
 
 
@@ -99,7 +111,7 @@ class ExpertOffloadManager:
         ]
         try:
             for binding in discovered:
-                if not binding.loaded or binding.layer_name in self.bindings:
+                if not binding.resident or binding.layer_name in self.bindings:
                     raise RuntimeError("incomplete or duplicate expert offload layer registration")
                 self.bindings[binding.layer_name] = binding
                 binding.manager = self

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pydantic import ConfigDict, StrictBool
+from pydantic import ConfigDict, Field, StrictBool, StrictInt, model_validator
 
 from vllm_ascend.config_utils import config
 
@@ -16,10 +16,23 @@ class ExpertOffloadConfig:
     """Exact single-worker offload. Unknown keys and ambiguous types fail fast."""
 
     enabled: StrictBool = False
+    num_device_experts: StrictInt | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_capacity(self):
+        if self.enabled and self.num_device_experts is None:
+            raise ValueError("expert_offload_config.num_device_experts is required when enabled")
+        return self
 
     def validate_layer(self, num_experts: int, top_k: int) -> None:
-        if self.enabled and not 1 <= top_k <= num_experts:
-            raise ValueError("expert offload requires 1 <= top_k <= num_experts")
+        if not self.enabled:
+            return
+        slots = self.num_device_experts
+        if slots is None or not 1 <= top_k <= slots < num_experts:
+            raise ValueError(
+                "expert offload requires 1 <= top_k <= num_device_experts < num_experts; "
+                f"got top_k={top_k}, slots={slots}, experts={num_experts}"
+            )
 
     def validate(self, vllm_config: VllmConfig, ascend_config) -> None:
         if not self.enabled:

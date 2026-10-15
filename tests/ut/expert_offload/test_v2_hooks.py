@@ -179,7 +179,7 @@ def test_quant_wrapper_preserves_disabled_allocation_and_bounds_enabled_loading(
         def __init__(self, moe_config):
             pass
 
-    config = ExpertOffloadConfig(enabled=enabled)
+    config = ExpertOffloadConfig(enabled=enabled, num_device_experts=2 if enabled else None)
     binding_factory = Mock()
 
     def set_attrs(param, attrs):
@@ -235,7 +235,7 @@ def test_quant_wrapper_preserves_disabled_allocation_and_bounds_enabled_loading(
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_routed_owner_injects_offload_before_weight_creation(enabled):
-    offload_config = ExpertOffloadConfig(enabled=enabled)
+    offload_config = ExpertOffloadConfig(enabled=enabled, num_device_experts=2 if enabled else None)
     method = Mock()
     quant_config = SimpleNamespace(get_quant_method=Mock(return_value=method))
     cls = load_hook_class(
@@ -256,7 +256,7 @@ def test_routed_owner_injects_offload_before_weight_creation(enabled):
 
 
 def test_routed_owner_rejects_unquantized_or_unsupported_adapter():
-    offload_config = ExpertOffloadConfig(enabled=True)
+    offload_config = ExpertOffloadConfig(enabled=True, num_device_experts=2)
     cls = load_hook_class(
         "vllm_ascend/ops/fused_moe/routed_experts.py",
         "AscendRoutedExperts",
